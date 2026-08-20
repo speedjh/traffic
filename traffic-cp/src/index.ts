@@ -311,6 +311,52 @@ app.post('/api/campaigns', async (c) => {
   return c.json({ ok: true, id: cid })
 })
 
+app.post('/api/campaigns/import-json', async (c) => {
+  // 캠페인 '설정'만 이전(잡 자동생성 안 함). id 보존, 이름 기준 upsert.
+  const b = await c.req.json<any>()
+  const rows: any[] = b.campaigns || []
+  const db = c.env.DB
+  let created = 0, updated = 0
+  for (const r of rows) {
+    const ex = await db.prepare('SELECT id FROM campaigns WHERE id=? OR name=?').bind(r.id ?? -1, r.name).first<any>()
+    const vals = [r.name, r.traffic_type, r.keyword || '', r.place_url || '', r.place_name || '',
+      r.daily_quota ?? 0, r.start_date || '', r.days ?? 1, r.status || 'paused', r.params_json || '{}']
+    if (ex) {
+      await db.prepare(`UPDATE campaigns SET name=?, traffic_type=?, keyword=?, place_url=?, place_name=?,
+        daily_quota=?, start_date=?, days=?, status=?, params_json=? WHERE id=?`).bind(...vals, ex.id).run()
+      updated++
+    } else if (r.id) {
+      await db.prepare(`INSERT INTO campaigns (id,name,traffic_type,keyword,place_url,place_name,daily_quota,start_date,days,status,params_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`).bind(r.id, ...vals).run()
+      created++
+    } else {
+      await db.prepare(`INSERT INTO campaigns (name,traffic_type,keyword,place_url,place_name,daily_quota,start_date,days,status,params_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(...vals).run()
+      created++
+    }
+  }
+  return c.json({ created, updated, total: rows.length })
+})
+
+app.post('/api/campaigns/:id/activate', async (c) => {
+  // 설정만 있는 캠페인을 활성화하며 오늘부터 잡 생성(materialize)
+  const id = Number(c.req.param('id')); const db = c.env.DB
+  const camp = await db.prepare('SELECT * FROM campaigns WHERE id=?').bind(id).first<any>()
+  if (!camp) return c.json({ error: 'not found' }, 404)
+  const start = kstToday()
+  await db.prepare(`UPDATE campaigns SET status='active', start_date=? WHERE id=?`).bind(start, id).run()
+  await db.prepare('DELETE FROM jobs WHERE campaign_id=? AND status=?').bind(id, 'pending').run()
+  for (let d = 0; d < camp.days; d++) {
+    const day = addDays(start, d)
+    const seqBase = (await db.prepare('SELECT COALESCE(MAX(queue_seq),0) m FROM jobs WHERE schedule_date=?').bind(day).first<any>())?.m ?? 0
+    const stmts = []
+    for (let i = 0; i < camp.daily_quota; i++)
+      stmts.push(db.prepare('INSERT INTO jobs (campaign_id,schedule_date,queue_seq,status) VALUES (?,?,?,?)').bind(id, day, seqBase + i + 1, 'pending'))
+    if (stmts.length) await db.batch(stmts)
+  }
+  return c.json({ ok: true, materialized: camp.daily_quota * camp.days })
+})
+
 app.post('/api/campaigns/:id/pause', async (c) => {
   const id = Number(c.req.param('id'))
   await c.env.DB.prepare(`UPDATE campaigns SET status='paused' WHERE id=?`).bind(id).run()
@@ -323,6 +369,7 @@ app.post('/api/campaigns/:id/pause', async (c) => {
 // ══════════════════════════════════════════════════════════════════════════
 app.get('/', (c) => c.html(page('대시보드', dashHtml())))
 app.get('/accounts', (c) => c.html(page('카카오 계정', accountsHtml())))
+app.get('/campaigns', (c) => c.html(page('캠페인', campaignsHtml())))
 
 const page = (title: string, body: string) => `<!doctype html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -344,7 +391,7 @@ input,textarea,select{padding:7px 9px;border:1px solid var(--line);border-radius
 .tag-verify_required{background:#f6e3cf;color:var(--warn)}.tag-bad{background:#f3d9d9;color:var(--danger)}
 .muted{color:var(--muted)}code{background:#eee7db;padding:1px 5px;border-radius:5px;font-size:.82rem}
 </style></head><body><div class="wrap">
-<nav class="nav"><a class="brand" href="/">Traffic CP</a><a href="/">대시보드</a><a href="/accounts">카카오 계정</a></nav>
+<nav class="nav"><a class="brand" href="/">Traffic CP</a><a href="/">대시보드</a><a href="/campaigns">캠페인</a><a href="/accounts">카카오 계정</a></nav>
 ${body}</div></body></html>`
 
 const dashHtml = () => `<h1>대시보드</h1><p class="sub">Cloudflare Workers + D1 컨트롤플레인</p>
@@ -383,6 +430,17 @@ async function load(){
 async function paste(){document.getElementById('tmsg').textContent='저장중…'
  const r=await j('/api/accounts/kakao/tokens/paste',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:document.getElementById('tok').value})})
  document.getElementById('tmsg').textContent='매칭 '+r.matched+' · 토큰 '+r.tokens_saved+(r.unmatched.length?' · 미매칭 '+r.unmatched.length:'');setTimeout(load,800)}
+load()
+</script>`
+
+const campaignsHtml = () => `<h1>캠페인</h1><p class="sub">설정된 캠페인. 활성화하면 오늘부터 일수×일유입량만큼 큐 생성.</p>
+<div class="panel"><table><thead><tr><th>#</th><th>이름</th><th>트래픽</th><th>키워드</th><th>장소</th><th>일유입/일수</th><th>상태</th><th></th></tr></thead><tbody id="rows"></tbody></table></div>
+<script>
+async function j(u,o){const r=await fetch(u,o);return r.json()}
+async function load(){const a=await j('/api/campaigns')
+ document.getElementById('rows').innerHTML=a.map(c=>'<tr><td class=muted>'+c.id+'</td><td>'+c.name+'</td><td>'+c.traffic_type+'</td><td>'+(c.keyword||'')+'</td><td>'+(c.place_name||'')+'</td><td>'+c.daily_quota+' / '+c.days+'</td><td><span class="tag '+(c.status==='active'?'tag-ok':'tag-unknown')+'">'+c.status+'</span></td><td>'+(c.status==='active'?'<button onclick="pause('+c.id+')">일시정지</button>':'<button onclick="act('+c.id+')">활성화</button>')+'</td></tr>').join('')}
+async function act(id){if(!confirm('활성화하면 오늘부터 큐가 생성됩니다. 계속?'))return;await j('/api/campaigns/'+id+'/activate',{method:'POST'});load()}
+async function pause(id){await j('/api/campaigns/'+id+'/pause',{method:'POST'});load()}
 load()
 </script>`
 
