@@ -7,5 +7,6 @@
   "d1_databases": [
     { "binding": "DB", "database_name": "traffic-cp", "database_id": "b8ea6672-5785-446f-8abb-9f70083c122c" }
   ],
+  "browser": { "binding": "BROWSER" },
   "observability": { "enabled": true }
 }

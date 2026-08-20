@@ -1,8 +1,9 @@
 // traffic-cp — 트래픽 컨트롤플레인 (Cloudflare Workers + D1)
 // campaign_web(FastAPI) 이식: 계정풀(투입 오래된 순 할당) / 워커 API / 캠페인·큐 / 대시보드
 import { Hono } from 'hono'
+import { fetchKakaoCode } from './outlook'
 
-type Env = { DB: D1Database }
+type Env = { DB: D1Database; BROWSER: any }
 const app = new Hono<{ Bindings: Env }>()
 
 // ── 시간 유틸 (KST 기준 날짜/시각) ─────────────────────────────────────────
@@ -175,10 +176,12 @@ function defaultVal(k: string): any {
 // 코드 조회 — Phase 2(Browser Rendering)에서 구현. 지금은 토큰 IMAP 경로만 자리표시.
 app.get('/api/accounts/kakao/:id/fetch-code', async (c) => {
   const id = Number(c.req.param('id'))
-  const a = await c.env.DB.prepare('SELECT mail_email, oauth_client_id FROM kakao_accounts WHERE id=?').bind(id).first<any>()
+  const wait = Number(c.req.query('wait') ?? 90)
+  const a = await c.env.DB.prepare('SELECT mail_email, mail_password FROM kakao_accounts WHERE id=?').bind(id).first<any>()
   if (!a) return c.json({ error: 'not found' }, 404)
-  // TODO Phase2: Cloudflare Browser Rendering 으로 아웃룩 로그인→코드 읽기
-  return c.json({ available: false, code: null, detail: 'code_reader_not_deployed_yet(phase2)' })
+  if (!a.mail_email || !a.mail_password) return c.json({ available: false, code: null, detail: 'no_mail_cred' })
+  const { code, detail } = await fetchKakaoCode(c.env, a.mail_email, a.mail_password, wait)
+  return c.json({ available: true, code, detail: 'cdp:' + detail, method: 'browser-rendering' })
 })
 
 // ══════════════════════════════════════════════════════════════════════════
