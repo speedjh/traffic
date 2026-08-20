@@ -40,3 +40,5 @@ night_monitor_log.md
 CLAUDE/.git-inner-backup/
 CLAUDE/__pycache__/
 /bin/
+traffic-cp/node_modules/
+traffic-cp/.wrangler/

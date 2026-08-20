@@ -13,7 +13,7 @@ cd /d "%~dp0"
 set "PATH=%~dp0platform-tools;%PATH%"
 
 REM --- 서버 주소 (웹/큐). 기본값을 여기 넣거나 실행 전 set API=... 로 지정 ---
-if "%API%"=="" set "API=http://127.0.0.1:8080"
+if "%API%"=="" set "API=https://traffic-cp.hywogur0327.workers.dev"
 
 REM --- 파이썬 실행자 (venv 있으면 우선) ---
 if exist "%~dp0.venv\Scripts\python.exe" (
