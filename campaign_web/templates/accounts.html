@@ -1,0 +1,218 @@
+{% extends "base.html" %}
+{% block title %}카카오 계정 · Campaign Queue{% endblock %}
+{% block content %}
+<h1>카카오 계정</h1>
+<p class="sub">
+  카카오맵 로그인 트래픽용 계정 풀. 할당은 <b>투입이 제일 오래된 순</b>으로,
+  아래 표의 위에서부터 차례로 나갑니다. 아웃룩 이메일·비번은 카카오 계정 정보가 아니라 저장하지 않습니다.
+</p>
+
+<div class="grid">
+  <div class="card"><div class="label">전체</div><div class="value">{{ stats.total }}</div></div>
+  <div class="card"><div class="label">사용 가능(active)</div><div class="value">{{ stats.by_status.get('active', 0) }}</div></div>
+  <div class="card"><div class="label">미투입</div><div class="value">{{ stats.never_used }}</div></div>
+  <div class="card"><div class="label">오늘 투입</div><div class="value">{{ stats.used_today }}</div></div>
+</div>
+
+<div class="panel">
+  <h2>엑셀 업로드</h2>
+  <form id="import-form" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".xlsx" required />
+    <button type="submit">업로드</button>
+    <span id="import-msg" class="muted"></span>
+  </form>
+  <p class="muted" style="margin:10px 0 0; font-size:0.85rem;">
+    <b>카카오이메일 / 비밀번호</b> 열이 필요합니다. 닉네임·인증방식·일일제한·상태는 있으면 함께 반영합니다.
+    이메일 기준으로 upsert 되며 <b>투입 이력은 보존</b>됩니다.
+  </p>
+</div>
+
+<div class="panel">
+  <h2>아웃룩 API 토큰 붙여넣기 <span class="muted" style="font-weight:400;font-size:0.85rem;">(서버가 코드를 대신 읽어줌)</span></h2>
+  <p class="muted" style="margin:0 0 8px;font-size:0.85rem;">
+    한 줄에 한 계정: <code>카카오메일----카카오비번----닉네임----아웃룩메일----아웃룩비번----client_id----refresh_token</code><br>
+    카카오메일 기준으로 매칭됩니다. 저장 시 토큰 유효성도 자동 검증합니다.
+  </p>
+  <form id="token-form">
+    <textarea name="text" rows="4" style="width:100%;font-family:monospace;font-size:0.8rem;padding:8px;border:1px solid var(--line);border-radius:8px;" placeholder="egapn419224@kakao.com----MFJi0s0n3h3----닉네임----WendyPalmer9875@outlook.lv----cvrdrf2405----dbc8e03a-...----M.C527_..."></textarea>
+    <div style="margin-top:8px;"><button type="submit">저장·검증</button> <span id="token-msg" class="muted"></span></div>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>계정 직접 추가</h2>
+  <form id="add-form" class="inline-form">
+    <input name="email" type="text" placeholder="카카오 이메일" required />
+    <input name="password" type="text" placeholder="비밀번호" required />
+    <input name="nickname" type="text" placeholder="닉네임(선택)" />
+    <input name="daily_limit" type="number" value="3" min="0" max="1000" title="일일제한" style="width:90px" />
+    <button type="submit">추가</button>
+    <span id="add-msg" class="muted"></span>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>계정 목록 <span class="muted" style="font-weight:400; font-size:0.85rem;">({{ accounts|length }}건 · 위에서부터 할당)</span></h2>
+
+  <form method="get" class="inline-form" style="margin-bottom:14px;">
+    <input type="text" name="q" value="{{ q }}" placeholder="이메일·닉네임 검색" />
+    <select name="status">
+      <option value="">상태 전체</option>
+      {% for s in ['active', 'inactive', 'disabled'] %}
+      <option value="{{ s }}" {% if filter_status == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+    <select name="login_state">
+      <option value="">로그인 상태 전체</option>
+      {% for s in ['unknown', 'ok', 'verify_required', 'bad_credential', 'blocked'] %}
+      <option value="{{ s }}" {% if filter_login_state == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">필터</button>
+    <a href="/accounts">초기화</a>
+  </form>
+
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>이메일</th>
+        <th>비밀번호</th>
+        <th>닉네임</th>
+        <th>상태</th>
+        <th>로그인</th>
+        <th>오늘/제한</th>
+        <th>누적</th>
+        <th>마지막 투입</th>
+        <th>리스</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for a in accounts %}
+      <tr data-id="{{ a.id }}">
+        <td class="muted">{{ loop.index }}</td>
+        <td>{{ a.email }}</td>
+        <td><span class="pw" data-pw="{{ a.password }}">••••••</span></td>
+        <td>{{ a.nickname }}</td>
+        <td>
+          <select class="f-status">
+            {% for s in ['active', 'inactive', 'disabled'] %}
+            <option value="{{ s }}" {% if a.status == s %}selected{% endif %}>{{ s }}</option>
+            {% endfor %}
+          </select>
+        </td>
+        <td>
+          <span class="tag tag-{{ a.login_state }}">{{ a.login_state }}</span>
+          {% if a.warmed_at %}<span class="tag tag-ok" title="이 기기에서 로그인 성공 이력">예열</span>{% endif %}
+          {% if a.oauth_status == 'valid' %}<span class="tag tag-ok" title="아웃룩 API 토큰 유효">API✓</span>
+          {% elif a.oauth_status == 'invalid' %}<span class="tag tag-bad" title="토큰 만료/무효">API✗</span>{% endif %}
+        </td>
+        <td>{{ a.used_today }} / {{ a.daily_limit if a.daily_limit > 0 else '∞' }}</td>
+        <td>
+          {{ a.total_used }}
+          {% if a.fail_streak %}<span class="tag tag-bad">연속실패 {{ a.fail_streak }}</span>{% endif %}
+        </td>
+        <td class="muted">{{ a.last_used_at.strftime('%m-%d %H:%M') if a.last_used_at else '미투입' }}</td>
+        <td class="muted">{{ a.leased_by or '' }}</td>
+        <td><button class="del" title="삭제">×</button></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if not accounts %}
+  <p class="muted">계정이 없습니다. 위에서 엑셀을 업로드하세요.</p>
+  {% endif %}
+</div>
+
+<style>
+  .inline-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .inline-form input, .inline-form select { padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; }
+  .muted { color: var(--muted); }
+  .pw { cursor: pointer; font-family: monospace; letter-spacing: 1px; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; }
+  .tag-ok { background: #d9efe2; color: var(--ok); }
+  .tag-unknown { background: #ece7de; color: var(--muted); }
+  .tag-verify_required { background: #f6e3cf; color: var(--warn); }
+  .tag-bad_credential, .tag-blocked, .tag-bad { background: #f3d9d9; color: var(--danger); }
+  td select { padding: 3px 5px; border: 1px solid var(--line); border-radius: 6px; font-size: 0.85rem; }
+  button.del { border: none; background: none; color: var(--danger); cursor: pointer; font-size: 1.1rem; }
+</style>
+
+<script>
+  // 비밀번호 클릭 시 토글
+  document.querySelectorAll('.pw').forEach(function (el) {
+    el.addEventListener('click', function () {
+      var shown = el.dataset.shown === '1';
+      el.textContent = shown ? '••••••' : el.dataset.pw;
+      el.dataset.shown = shown ? '0' : '1';
+    });
+  });
+
+  async function patch(id, body) {
+    const r = await fetch('/api/accounts/kakao/' + id, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) alert('변경 실패: ' + (await r.text()));
+  }
+
+  document.querySelectorAll('tr[data-id]').forEach(function (tr) {
+    const id = tr.dataset.id;
+    const sel = tr.querySelector('.f-status');
+    if (sel) sel.addEventListener('change', function () { patch(id, { status: sel.value }); });
+    const del = tr.querySelector('.del');
+    if (del) del.addEventListener('click', async function () {
+      if (!confirm('이 계정을 삭제할까요?')) return;
+      const r = await fetch('/api/accounts/kakao/' + id, { method: 'DELETE' });
+      if (r.ok) tr.remove(); else alert('삭제 실패');
+    });
+  });
+
+  document.getElementById('import-form').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    const msg = document.getElementById('import-msg');
+    msg.textContent = '업로드 중…';
+    const r = await fetch('/api/accounts/kakao/import', { method: 'POST', body: new FormData(e.target) });
+    const j = await r.json();
+    if (!r.ok) { msg.textContent = '실패: ' + (j.detail || ''); return; }
+    msg.textContent = '신규 ' + j.created + '건 · 갱신 ' + j.updated + '건'
+      + (j.skipped_columns && j.skipped_columns.length ? ' · 제외한 열: ' + j.skipped_columns.join(', ') : '');
+    setTimeout(function () { location.reload(); }, 1200);
+  });
+
+  document.getElementById('token-form').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    const msg = document.getElementById('token-msg');
+    msg.textContent = '저장·검증 중…';
+    const text = e.target.querySelector('textarea').value;
+    const r = await fetch('/api/accounts/kakao/tokens/paste', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text, validate: true }),
+    });
+    const j = await r.json();
+    if (!r.ok) { msg.textContent = '실패: ' + (j.detail || ''); return; }
+    msg.textContent = '매칭 ' + j.matched + ' · 토큰 ' + j.tokens_saved + ' (유효 ' + j.valid + ' / 무효 ' + j.invalid + ')'
+      + (j.unmatched && j.unmatched.length ? ' · 미매칭 ' + j.unmatched.length : '');
+    setTimeout(function(){ location.reload(); }, 1800);
+  });
+
+  document.getElementById('add-form').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const msg = document.getElementById('add-msg');
+    const r = await fetch('/api/accounts/kakao', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: f.get('email'), password: f.get('password'),
+        nickname: f.get('nickname') || '', daily_limit: Number(f.get('daily_limit') || 3),
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) { msg.textContent = '실패: ' + (j.detail || ''); return; }
+    location.reload();
+  });
+</script>
+{% endblock %}

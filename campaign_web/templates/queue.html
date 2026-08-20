@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}작업큐 · Campaign Queue{% endblock %}
+{% block content %}
+  <h1>작업큐</h1>
+  <p class="sub">날짜별 인터리브된 순서. A 전부 다음 B가 아니라 A/B/C가 교차합니다.</p>
+
+  <form class="panel" method="get" action="/queue" style="display:flex;gap:10px;align-items:end">
+    <div class="field" style="margin:0">
+      <label>일자</label>
+      <input type="date" name="day" value="{{ day }}" />
+    </div>
+    <button class="btn" type="submit">보기</button>
+  </form>
+
+  <div class="panel">
+    <h2>{{ day }} · {{ jobs|length }} jobs</h2>
+    {% if jobs %}
+    <table>
+      <thead>
+        <tr>
+          <th>Seq</th><th>캠페인</th><th>트래픽</th><th>예정시각</th><th>상태</th><th>기기</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for j in jobs %}
+        <tr>
+          <td>{{ j.queue_seq }}</td>
+          <td>{{ j.campaign_name }}</td>
+          <td>{{ traffic[j.traffic_type].label if j.traffic_type in traffic else j.traffic_type }}</td>
+          <td class="muted">{{ j.scheduled_at or '-' }}</td>
+          <td><span class="badge {{ j.status }}">{{ j.status }}</span></td>
+          <td class="muted">{{ j.device_serial or '-' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="muted">이 날짜의 job이 없습니다.</p>
+    {% endif %}
+  </div>
+{% endblock %}

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}Campaign Queue{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="wrap">
+    <nav class="nav">
+      <a class="brand" href="/">Campaign Queue</a>
+      <a href="/" class="{% if request.url.path == '/' %}active{% endif %}">대시보드</a>
+      <a href="/campaigns/new" class="{% if request.url.path == '/campaigns/new' %}active{% endif %}">캠페인 생성</a>
+      <a href="/queue" class="{% if request.url.path.startswith('/queue') %}active{% endif %}">작업큐</a>
+      <a href="/accounts" class="{% if request.url.path.startswith('/accounts') %}active{% endif %}">카카오 계정</a>
+    </nav>
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

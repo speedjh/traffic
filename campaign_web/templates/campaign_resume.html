@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}재개 · {{ c.name }}{% endblock %}
+{% block content %}
+  <h1>캠페인 재개</h1>
+  <p class="sub">
+    <strong>{{ c.name }}</strong> 을(를) 다시 돌리려면 일유입량과 진행 일수를 다시 입력하세요.
+    시작일은 오늘({{ today }})로 잡히고, 종료일은 오늘부터 N일입니다.
+  </p>
+
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+  <div class="panel" style="margin-bottom:16px">
+    <table class="kv">
+      <tr><th>이전 일유입량</th><td>{{ c.daily_quota }}회/일</td></tr>
+      <tr><th>이전 기간</th><td>{{ c.start_date }} ~ {{ c.end_date }} ({{ c.days }}일)</td></tr>
+      <tr><th>상태</th><td><span class="badge {{ c.status }}">{{ c.status }}</span></td></tr>
+    </table>
+  </div>
+
+  <form class="panel" method="post" action="/campaigns/{{ c.id }}/resume">
+    <div class="form-grid">
+      <div class="field">
+        <label>일유입량</label>
+        <input type="number" name="daily_quota" min="1" value="{{ c.daily_quota }}" required />
+        <div class="help">하루에 실행할 작업 횟수. 생성 시와 동일합니다.</div>
+      </div>
+      <div class="field">
+        <label>진행 일수</label>
+        <input type="number" name="days" min="1" value="{{ c.days }}" required />
+        <div class="help">오늘부터 N일. 5일이면 오늘~오늘+4일.</div>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn" type="submit">재개하고 큐에 넣기</button>
+      <a class="btn secondary" href="/">취소</a>
+    </div>
+  </form>
+{% endblock %}

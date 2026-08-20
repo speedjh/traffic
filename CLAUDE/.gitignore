@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+
+# 실행 산출물 / 디버그 덤프 (소스 아님)
+*.png
+*.xml

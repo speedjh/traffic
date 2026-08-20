@@ -1,0 +1,41 @@
+# ── 가상환경 / 바이너리 / 의존성 ──
+.venv/
+platform-tools/
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── 별도 프로젝트(무관) ──
+프리리워드/
+
+# ── 민감정보 (절대 커밋 금지) ──
+*.xlsx
+*.db
+*.db-shm
+*.db-wal
+ms_token.json
+device_pin.local
+*.local
+.dev.vars
+.env
+
+# ── 런타임 산출물 / 로그 / 프로필 ──
+campaign_web/logs/
+campaign_web/data/
+outlook_profiles/
+*.log
+night_monitor_log.md
+
+# ── 캡처/덤프 (대용량, 재생성 가능) ──
+*.png
+*.jpg
+*.jpeg
+*.xml
+
+# ── OS ──
+.DS_Store
+*.zip
+.claude/
+CLAUDE/.git-inner-backup/
+CLAUDE/__pycache__/

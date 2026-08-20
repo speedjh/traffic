@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}캠페인 생성 · Campaign Queue{% endblock %}
+{% block content %}
+  <h1>캠페인 생성</h1>
+  <p class="sub">일유입량 × 일수만큼 작업이 생성되고, 다른 캠페인과 섞여 큐에 들어갑니다.</p>
+
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+  <form class="panel" method="post" action="/campaigns/new">
+    <div class="form-grid">
+      <div class="field">
+        <label>캠페인 이름</label>
+        <input name="name" required placeholder="예: A_왕코등갈비" />
+      </div>
+      <div class="field">
+        <label>일유입량</label>
+        <input type="number" name="daily_quota" min="1" value="200" required />
+        <div class="help">하루에 실행할 작업 횟수. 200이면 매일 200회.</div>
+      </div>
+      <div class="field">
+        <label>시작일자</label>
+        <input type="date" name="start_date" value="{{ today }}" required />
+      </div>
+      <div class="field">
+        <label>일수</label>
+        <input type="number" name="days" min="1" value="5" required />
+        <div class="help">시작일부터 N일. 5일이면 시작일~시작일+4일.</div>
+      </div>
+      <div class="field full">
+        <label>트래픽 종류</label>
+        <div class="traffic-cards">
+          {% for t in traffic_types %}
+          <label class="traffic-option">
+            <input type="radio" name="traffic_type" value="{{ t.key }}" {% if loop.first %}checked{% endif %} required />
+            <span>
+              <strong>{{ t.label }}</strong>
+              <span class="desc">{{ t.description }}</span>
+            </span>
+          </label>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="field">
+        <label>키워드</label>
+        <input name="keyword" placeholder="검색 키워드" />
+      </div>
+      <div class="field">
+        <label>장소 URL (클릭/체류/풀)</label>
+        <input name="place_url" placeholder="https://place.map.kakao.com/..." />
+      </div>
+      <div class="field full">
+        <label>업체명 / 2차 키워드</label>
+        <input name="place_name" placeholder="카카오맵 업체명 또는 함많찾을 2차 검색어" />
+        <div class="help">함많찾을에서는 2차 검색 키워드로 사용합니다.</div>
+      </div>
+      <div class="field" id="dwell-min-field">
+        <label>체류 최소(초)</label>
+        <input type="number" name="dwell_min" min="1" step="1" value="15" />
+      </div>
+      <div class="field" id="dwell-max-field">
+        <label>체류 최대(초)</label>
+        <input type="number" name="dwell_max" min="1" step="1" value="20" />
+        <div class="help">카카오맵 일반트래픽·함많찾을에서 페이지 체류 시간 범위입니다.</div>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn" type="submit">생성하고 큐에 넣기</button>
+      <a class="btn secondary" href="/">취소</a>
+    </div>
+  </form>
+  <script>
+    (function () {
+      const radios = document.querySelectorAll('input[name="traffic_type"]');
+      const minF = document.getElementById('dwell-min-field');
+      const maxF = document.getElementById('dwell-max-field');
+      function sync() {
+        const v = document.querySelector('input[name="traffic_type"]:checked');
+        const key = v && v.value;
+        const show = key === 'kakao_search' || key === 'hamman_find';
+        minF.style.display = show ? '' : 'none';
+        maxF.style.display = show ? '' : 'none';
+      }
+      radios.forEach(r => r.addEventListener('change', sync));
+      sync();
+    })();
+  </script>
+{% endblock %}

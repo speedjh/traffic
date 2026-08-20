@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}대시보드 · Campaign Queue{% endblock %}
+{% block content %}
+  <h1>오늘 집행 현황</h1>
+  <p class="sub">{{ dash.today }} · 여러 캠페인이 라운드로빈으로 섞여 큐에 들어갑니다. 캠페인 이름을 누르면 설정을 볼 수 있습니다.</p>
+
+  {% if not worker_online %}
+  <div class="alert">워커가 오프라인입니다. 폰 USB 연결 후 <code>./run_campaign_worker.sh --serial {{ worker_serial }}</code> 를 실행하세요. 캠페인 재개만으로는 폰 작업이 시작되지 않습니다.</div>
+  {% endif %}
+  {% if adb_offline %}
+  <div class="alert">ADB에 폰이 안 보입니다 (USB는 꽂혀 있어도 충전 전용/디버깅 미허용일 수 있음). 폰에서 <strong>파일 전송(MTP)</strong> + <strong>USB 디버깅 허용</strong>을 켠 뒤 케이블을 다시 꽂아 주세요. 지금 실패가 많은 이유가 이것입니다.</div>
+  {% endif %}
+
+  <div class="grid">
+    <div class="card"><div class="label">대기(오늘)</div><div class="value">{{ dash.pending_today }}</div></div>
+    <div class="card"><div class="label">실행중</div><div class="value">{{ dash.running }}</div></div>
+    <div class="card"><div class="label">성공(오늘)</div><div class="value">{{ dash.success_today }}</div></div>
+    <div class="card"><div class="label">실패(오늘)</div><div class="value">{{ dash.failed_today }}</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>캠페인</h2>
+    {% if dash.campaigns %}
+    <table>
+      <thead>
+        <tr>
+          <th>이름</th><th>트래픽</th><th>상태</th><th>일유입량</th>
+          <th>오늘 진행</th><th>기간</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for c in dash.campaigns %}
+        <tr class="clickable-row" onclick="location.href='/campaigns/{{ c.id }}'" title="설정 보기">
+          <td><strong><a href="/campaigns/{{ c.id }}" onclick="event.stopPropagation()">{{ c.name }}</a></strong></td>
+          <td>{{ traffic[c.traffic_type].label if c.traffic_type in traffic else c.traffic_type }}</td>
+          <td><span class="badge {{ c.status }}">{{ c.status }}</span></td>
+          <td>{{ c.daily_quota }}</td>
+          <td>{{ c.done_today }}/{{ c.planned_today }} <span class="muted">(fail {{ c.failed_today }})</span></td>
+          <td>{{ c.start_date }} · {{ c.days }}일</td>
+          <td onclick="event.stopPropagation()">
+            {% if c.status == 'active' %}
+            <form method="post" action="/campaigns/{{ c.id }}/pause" style="display:inline">
+              <button class="btn danger" type="submit">중단</button>
+            </form>
+            {% elif c.status in ('paused', 'stopped') %}
+            <a class="btn secondary" href="/campaigns/{{ c.id }}/resume">재개</a>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="muted">등록된 캠페인이 없습니다. <a href="/campaigns/new">캠페인을 만들어보세요</a>.</p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>디바이스 (워커)</h2>
+    {% if dash.devices %}
+    <table>
+      <thead><tr><th>Serial</th><th>Host</th><th>상태</th><th>Busy Job</th><th>Heartbeat</th></tr></thead>
+      <tbody>
+      {% for d in dash.devices %}
+        <tr>
+          <td>{{ d.serial }}</td>
+          <td>{{ d.host }}</td>
+          <td><span class="badge {{ 'online' if d.online else 'offline' }}">{{ 'online' if d.online else 'offline' }}</span></td>
+          <td>{{ d.busy_job_id or '-' }}</td>
+          <td class="muted">{{ d.last_heartbeat or '-' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="muted">아직 heartbeat 한 워커가 없습니다. <code>./run_campaign_worker.sh --serial DEVICE</code></p>
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h2>오늘 큐 미리보기 <a href="/queue" style="font-size:0.85rem;font-weight:600">전체 보기</a></h2>
+    {% if dash.queue_preview %}
+      <div>
+      {% for j in dash.queue_preview %}
+        <span class="queue-chip">
+          <strong>#{{ j.queue_seq }}</strong>
+          {{ j.campaign_name }}
+          <span class="badge {{ j.status }}">{{ j.status }}</span>
+        </span>
+      {% endfor %}
+      </div>
+    {% else %}
+      <p class="muted">오늘 큐가 비어 있습니다.</p>
+    {% endif %}
+  </div>
+{% endblock %}

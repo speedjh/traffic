@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}{{ c.name }} · 캠페인 설정{% endblock %}
+{% block content %}
+  <h1>{{ c.name }}</h1>
+  <p class="sub">등록 시 세팅한 캠페인 설정입니다. <a href="/">← 대시보드</a></p>
+
+  {% if flash %}<div class="ok">{{ flash }}</div>{% endif %}
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+  <div class="panel">
+    <h2>기본</h2>
+    <table class="kv">
+      <tr><th>상태</th><td><span class="badge {{ c.status }}">{{ c.status }}</span></td></tr>
+      <tr><th>트래픽</th><td>{{ traffic_label }} <span class="muted">({{ c.traffic_type }})</span></td></tr>
+      <tr><th>일유입량</th><td>{{ c.daily_quota }}회/일</td></tr>
+      <tr><th>기간</th><td>{{ c.start_date }} ~ {{ c.end_date }} ({{ c.days }}일)</td></tr>
+      <tr><th>생성시각</th><td class="muted">{{ c.created_at }}</td></tr>
+    </table>
+  </div>
+
+  {% if c.status in ('active', 'paused') %}
+  <form class="panel" method="post" action="/campaigns/{{ c.id }}/settings">
+    <h2>유입·일수 수정</h2>
+    <p class="help" style="margin:0 0 12px">
+      저장하면 남은 대기 작업 큐가 바로 다시 맞춰집니다. (실행 중·완료 job은 유지)
+      <strong style="display:block;margin-top:6px;color:var(--ok,#1a7f37)">즉시 반영됩니다.</strong>
+    </p>
+    <div class="form-grid">
+      <div class="field">
+        <label>일유입량</label>
+        <input type="number" name="daily_quota" min="1" value="{{ c.daily_quota }}" required />
+        <div class="help">하루에 실행할 작업 횟수.</div>
+      </div>
+      <div class="field">
+        <label>진행 일수</label>
+        <input type="number" name="days" min="1" max="365" value="{{ c.days }}" required />
+        <div class="help">
+          시작일({{ c.start_date }})부터 N일. 종료일 = 시작일+N−1.
+          {% if c.status == 'paused' %}일시정지 상태에서는 설정만 바뀌고, 재개 시 반영됩니다.{% endif %}
+        </div>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn" type="submit">저장 (즉시 반영)</button>
+    </div>
+  </form>
+
+  <form class="panel" method="post" action="/campaigns/{{ c.id }}/settings">
+    <h2>키워드·체류 수정</h2>
+    <p class="help" style="margin:0 0 12px">
+      저장하면 DB에 바로 반영되고, <strong>다음에 claim 되는 job부터</strong> 새 키워드로 실행됩니다.
+      (대기 큐 재구축 불필요 · 이미 실행 중인 job은 기존 값 유지)
+      <strong style="display:block;margin-top:6px;color:var(--ok,#1a7f37)">즉시 반영됩니다.</strong>
+    </p>
+    <div class="form-grid">
+      <div class="field">
+        <label>키워드</label>
+        <input name="keyword" value="{{ c.keyword or '' }}" placeholder="검색 키워드" />
+        <div class="help">1차 검색어. 함많찾을·다음·카카오 공통.</div>
+      </div>
+      <div class="field">
+        <label>{% if c.traffic_type == 'hamman_find' %}2차 키워드{% else %}업체명 / 2차 키워드{% endif %}</label>
+        <input name="keyword2" value="{{ keyword2_value }}" placeholder="예: 수유소고기 청가숯불구이" />
+        <div class="help">
+          {% if c.traffic_type == 'hamman_find' %}
+          함많찾을 2차 검색어 (<code>--keyword2</code>). place_name 과 함께 저장됩니다.
+          {% else %}
+          카카오맵 업체명 등. 함많찾을이면 2차 검색어로도 씁니다.
+          {% endif %}
+        </div>
+      </div>
+      <div class="field full">
+        <label>장소 URL</label>
+        <input name="place_url" value="{{ c.place_url or '' }}" placeholder="https://place.map.kakao.com/..." />
+      </div>
+      {% if show_dwell %}
+      <div class="field">
+        <label>체류 최소(초)</label>
+        <input type="number" name="dwell_min" min="1" step="1" value="{{ dwell_min }}" />
+      </div>
+      <div class="field">
+        <label>체류 최대(초)</label>
+        <input type="number" name="dwell_max" min="1" step="1" value="{{ dwell_max }}" />
+        <div class="help">카카오맵 일반트래픽·함많찾을 체류 시간 범위.</div>
+      </div>
+      {% endif %}
+    </div>
+    <div class="actions">
+      <button class="btn" type="submit">저장 (즉시 반영)</button>
+    </div>
+  </form>
+  {% endif %}
+
+  <div class="panel">
+    <h2>검색·장소</h2>
+    <table class="kv">
+      <tr><th>키워드</th><td>{{ c.keyword or '—' }}</td></tr>
+      <tr><th>{% if c.traffic_type == 'hamman_find' %}2차 키워드{% else %}업체명{% endif %}</th>
+        <td>{{ keyword2_value or c.place_name or '—' }}</td></tr>
+      <tr><th>장소 URL</th>
+        <td>
+          {% if c.place_url %}
+          <a href="{{ c.place_url }}" target="_blank" rel="noopener">{{ c.place_url }}</a>
+          {% else %}—{% endif %}
+        </td>
+      </tr>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>추가 파라미터</h2>
+    {% if c.params %}
+    <table class="kv">
+      {% for k, v in c.params.items() %}
+      <tr><th>{{ k }}</th><td>{{ v }}</td></tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="muted">추가 파라미터 없음</p>
+    {% endif %}
+  </div>
+
+  {% if run_cmd %}
+  <div class="panel">
+    <h2>실행 커맨드 (참고)</h2>
+    <pre class="cmd">{{ run_cmd }}</pre>
+  </div>
+  {% endif %}
+
+  <div class="panel">
+    <h2>오늘 진행</h2>
+    <p>{{ done_today }} / {{ planned_today }} 성공
+      <span class="muted">(실패 {{ failed_today }}, 대기 {{ pending_today }})</span>
+    </p>
+    {% if recent_fails %}
+    <h3 style="font-size:0.95rem;margin:14px 0 8px">최근 실패</h3>
+    <table>
+      <thead><tr><th>Job</th><th>시각</th><th>원인</th></tr></thead>
+      <tbody>
+      {% for j in recent_fails %}
+        <tr>
+          <td>#{{ j.id }}</td>
+          <td class="muted">{{ j.finished_at }}</td>
+          <td>{{ j.error_message or '—' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+    <div class="actions" style="margin-top:12px">
+      {% if c.status == 'active' %}
+      <form method="post" action="/campaigns/{{ c.id }}/pause" style="display:inline">
+        <button class="btn danger" type="submit">중단</button>
+      </form>
+      {% elif c.status in ('paused', 'stopped') %}
+      <a class="btn secondary" href="/campaigns/{{ c.id }}/resume">재개</a>
+      {% endif %}
+      <a class="btn secondary" href="/">대시보드</a>
+    </div>
+  </div>
+{% endblock %}
