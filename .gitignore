@@ -39,3 +39,4 @@ night_monitor_log.md
 .claude/
 CLAUDE/.git-inner-backup/
 CLAUDE/__pycache__/
+/bin/
