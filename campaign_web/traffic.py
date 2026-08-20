@@ -2,6 +2,8 @@
 """트래픽 종류 정의 + 실행 커맨드 매핑."""
 from __future__ import annotations
 
+import sys
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -131,7 +133,7 @@ def build_command(
         py = root / "CLAUDE" / "kakao_search_device.py"
         place = place_name or keyword
         cmd = [
-            "python3",
+            sys.executable or "python",
             str(py),
             keyword,
             place,

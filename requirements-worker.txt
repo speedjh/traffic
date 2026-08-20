@@ -1,0 +1,3 @@
+# campaign_web 워커(작업 실행 노드)용 최소 의존성
+httpx>=0.27
+uiautomator2>=3.0

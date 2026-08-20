@@ -1236,7 +1236,10 @@ def run_once(d: u2.Device, args) -> tuple:
             sys.path.insert(0, _root)
         import kakao_login
 
-        result, detail = kakao_login.login(d, args.kakao_id, args.kakao_pw)
+        result, detail = kakao_login.login(
+            d, args.kakao_id, args.kakao_pw,
+            code_fetcher=make_code_fetcher(getattr(args, "code_api", ""), getattr(args, "account_id", 0)),
+        )
         args.login_result = result
         args.login_detail = detail
         if result != kakao_login.OK:
@@ -1297,6 +1300,10 @@ def main():
                     help="카카오 로그인 계정(이메일). 지정하면 로그인 기반 트래픽")
     ap.add_argument("--kakao-pw", default="",
                     help="카카오 로그인 비밀번호")
+    ap.add_argument("--account-id", type=int, default=0,
+                    help="웹 계정 id — 추가인증 시 서버가 이 계정 메일함에서 코드를 읽어옴")
+    ap.add_argument("--code-api", default="",
+                    help="서버 API 주소(예: http://SERVER:8080) — 추가인증 코드 서버조회용")
     args = ap.parse_args()
     if args.route is not None:
         args.mode = "route" if args.route else "search"
