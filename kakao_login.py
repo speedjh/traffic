@@ -119,16 +119,42 @@ def dismiss_chrome_fre(d: u2.Device, timeout: float = 12.0) -> None:
             time.sleep(0.8)
 
 
+PERM_DENY = ("허용 안함", "허용 안 함", "이번에는 허용 안함", "Don't allow", "Deny", "나중에", "아니요")
+
+
+def _dismiss_perms(d: u2.Device, rounds: int = 4):
+    """pm clear 후 뜨는 알림/위치 권한 다이얼로그를 거부(닫기)."""
+    for _ in range(rounds):
+        hit = False
+        for t in PERM_DENY:
+            if _click_text(d, t):
+                hit = True
+                time.sleep(0.8)
+                break
+        if not hit:
+            break
+
+
 def open_login_page(d: u2.Device, timeout: float = 25.0) -> bool:
     """카카오맵 메인 → 카카오계정 로그인 페이지까지 진입."""
-    if not _click_text(d, "로그인", timeout=8.0):
+    # fresh 진입 시 권한 다이얼로그가 로그인 흐름을 막으므로 먼저 정리
+    _dismiss_perms(d)
+    # 하단 '로그인' 버튼 재시도 (패널 접힘/권한창 잔여 대비)
+    clicked = False
+    for i in range(6):
+        _dismiss_perms(d, rounds=2)
+        if _click_text(d, "로그인", timeout=3.0):
+            clicked = True
+            break
+        time.sleep(1.2)
+    if not clicked:
         _log("[!] 하단 패널의 '로그인' 을 찾지 못함 (이미 로그인 상태일 수 있음)")
         return False
     time.sleep(2.0)
 
-    if not _click_text(d, "카카오계정 직접 입력", timeout=8.0):
+    if not _click_text(d, "카카오계정 직접 입력", timeout=10.0):
         _log("[!] '카카오계정 직접 입력' 버튼 없음")
-        return False
+        # 동의화면이 이미 떠 있을 수도 있음 — 계속 진행
     time.sleep(3.0)
 
     dismiss_chrome_fre(d)
@@ -138,6 +164,12 @@ def open_login_page(d: u2.Device, timeout: float = 25.0) -> bool:
         if _xp(d, ID_FIELD).exists:
             _log("카카오계정 로그인 페이지 도달")
             return True
+        xml = _screen_text(d)
+        # kakao 가 이전 계정을 기억한 동의화면 → 다른 계정으로 로그인
+        if "다른 카카오계정으로 로그인" in xml:
+            _log("동의화면(기억된 계정) — '다른 카카오계정으로 로그인' 클릭")
+            _click_text(d, "다른 카카오계정으로 로그인")
+            time.sleep(2.5)
         time.sleep(1.0)
     _log("[!] 로그인 페이지 로딩 실패")
     return False

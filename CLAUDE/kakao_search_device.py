@@ -1220,6 +1220,38 @@ def general_traffic_from_detail(
     )
 
 
+def make_code_fetcher(code_api: str, account_id: int):
+    """추가인증 시 서버(컨트롤플레인)가 아웃룩 메일함에서 코드를 읽어오게 하는 콜백."""
+    if not code_api or not account_id:
+        return None
+    import json as _json
+    import urllib.request as _u
+
+    def fetch():
+        base = code_api.rstrip("/")
+        for attempt in range(3):
+            url = f"{base}/api/accounts/kakao/{account_id}/fetch-code?wait=120"
+            try:
+                req = _u.Request(url, headers={"User-Agent": "Mozilla/5.0 (worker; kakao-traffic)"})
+                with _u.urlopen(req, timeout=200) as r:
+                    j = _json.load(r)
+            except Exception as e:
+                print(f"[code] 서버조회 오류({attempt+1}/3): {e}", flush=True)
+                time.sleep(10)
+                continue
+            if not j.get("available"):
+                print(f"[code] 서버조회 불가: {j.get('detail')}", flush=True)
+                return ""
+            if j.get("code"):
+                print(f"[code] 서버조회 성공: {j['code']} ({j.get('detail')})", flush=True)
+                return j["code"]
+            print(f"[code] 코드 미도착({attempt+1}/3): {j.get('detail')} — 재시도", flush=True)
+            time.sleep(10)
+        return ""
+
+    return fetch
+
+
 def run_once(d: u2.Device, args) -> tuple:
     """1 로테이션. Returns: (작업 성공 여부, 카카오맵 실행 여부)."""
     print("[*] 로테이션 시작 전 데이터·IP 확인")
@@ -1227,6 +1259,14 @@ def run_once(d: u2.Device, args) -> tuple:
         print("[!] 연결 미확인 → 카카오맵 진입 생략 (이번 로테이션 스킵)")
         return False, False
     fast_entry = args.mode == "search"
+    login_mode = bool(getattr(args, "kakao_id", "") and getattr(args, "kakao_pw", ""))
+    # 로그인 모드: 매 job(rotations=1)마다 leased 계정으로 새로 로그인해야 하므로
+    # 진입 전 앱 데이터를 지워 이전 세션(다른 계정)을 확실히 제거한다.
+    if login_mode:
+        print("[*] 로그인 모드 — 진입 전 카카오맵+Chrome 데이터 삭제(이전 계정 세션·쿠키 제거)")
+        _adb(args.serial, "shell", "pm", "clear", PKG)
+        _adb(args.serial, "shell", "pm", "clear", "com.android.chrome")
+        time.sleep(2.5)
     open_kakaomap(d, args.serial)
 
     # 로그인 타이밍: 앱 데이터 삭제 + IP 변경 후 새 작업으로 들어가는 지금.
