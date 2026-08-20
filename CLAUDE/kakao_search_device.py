@@ -1260,30 +1260,35 @@ def run_once(d: u2.Device, args) -> tuple:
         return False, False
     fast_entry = args.mode == "search"
     login_mode = bool(getattr(args, "kakao_id", "") and getattr(args, "kakao_pw", ""))
-    # 로그인 모드: 매 job(rotations=1)마다 leased 계정으로 새로 로그인해야 하므로
-    # 진입 전 앱 데이터를 지워 이전 세션(다른 계정)을 확실히 제거한다.
-    if login_mode:
-        print("[*] 로그인 모드 — 진입 전 카카오맵+Chrome 데이터 삭제(이전 계정 세션·쿠키 제거)")
-        _adb(args.serial, "shell", "pm", "clear", PKG)
-        _adb(args.serial, "shell", "pm", "clear", "com.android.chrome")
-        time.sleep(2.5)
-    open_kakaomap(d, args.serial)
-
-    # 로그인 타이밍: 앱 데이터 삭제 + IP 변경 후 새 작업으로 들어가는 지금.
-    if getattr(args, "kakao_id", "") and getattr(args, "kakao_pw", ""):
+    if not login_mode:
+        open_kakaomap(d, args.serial)
+    else:
+        # 로그인 모드: leased 계정으로 매번 새로 로그인. 진입 전 카카오맵+Chrome
+        # 데이터를 지워 이전 계정 세션·쿠키를 제거하고, 실패 시 최대 3회 재시도.
         _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if _root not in sys.path:
             sys.path.insert(0, _root)
         import kakao_login
 
-        result, detail = kakao_login.login(
-            d, args.kakao_id, args.kakao_pw,
-            code_fetcher=make_code_fetcher(getattr(args, "code_api", ""), getattr(args, "account_id", 0)),
-        )
+        cfetch = make_code_fetcher(getattr(args, "code_api", ""), getattr(args, "account_id", 0))
+        result, detail = "login_failed", ""
+        for attempt in range(1, 4):
+            print(f"[*] 로그인 시도 {attempt}/3 — 카카오맵+Chrome 데이터 삭제")
+            _adb(args.serial, "shell", "pm", "clear", PKG)
+            _adb(args.serial, "shell", "pm", "clear", "com.android.chrome")
+            time.sleep(2.5)
+            open_kakaomap(d, args.serial)
+            result, detail = kakao_login.login(d, args.kakao_id, args.kakao_pw, code_fetcher=cfetch, force=True)
+            if result == kakao_login.OK:
+                break
+            if result == kakao_login.BAD_CREDENTIAL:
+                break  # 재시도 무의미
+            print(f"[!] 로그인 결과 {result} — {'재시도' if attempt < 3 else '최종 실패'}")
+            kakao_login.abandon_login(d, args.serial)
+            time.sleep(2.0)
         args.login_result = result
         args.login_detail = detail
         if result != kakao_login.OK:
-            kakao_login.abandon_login(d, args.serial)
             print(f"[!] 로그인 실패({result}) → 이번 로테이션 스킵")
             return False, True
         print("[+] 로그인 완료 — 트래픽 시작")

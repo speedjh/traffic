@@ -135,41 +135,66 @@ def _dismiss_perms(d: u2.Device, rounds: int = 4):
             break
 
 
-def open_login_page(d: u2.Device, timeout: float = 25.0) -> bool:
-    """카카오맵 메인 → 카카오계정 로그인 페이지까지 진입."""
-    # fresh 진입 시 권한 다이얼로그가 로그인 흐름을 막으므로 먼저 정리
-    _dismiss_perms(d)
-    # 하단 '로그인' 버튼 재시도 (패널 접힘/권한창 잔여 대비)
-    clicked = False
-    for i in range(6):
-        _dismiss_perms(d, rounds=2)
-        if _click_text(d, "로그인", timeout=3.0):
-            clicked = True
-            break
-        time.sleep(1.2)
-    if not clicked:
-        _log("[!] 하단 패널의 '로그인' 을 찾지 못함 (이미 로그인 상태일 수 있음)")
-        return False
-    time.sleep(2.0)
+def _login_form_present(d: u2.Device) -> bool:
+    return _xp(d, ID_FIELD).exists
 
-    if not _click_text(d, "카카오계정 직접 입력", timeout=10.0):
-        _log("[!] '카카오계정 직접 입력' 버튼 없음")
-        # 동의화면이 이미 떠 있을 수도 있음 — 계속 진행
-    time.sleep(3.0)
 
-    dismiss_chrome_fre(d)
+def open_login_page(d: u2.Device, timeout: float = 55.0) -> bool:
+    """카카오맵 메인 → 카카오계정 로그인 폼(loginId--1)까지 진입.
 
+    fresh 진입 시 나타나는 모든 인터스티셜(권한 다이얼로그 / Chrome 최초실행 /
+    이전 계정 동의화면)을 매 반복마다 판별·처리하며, 진입 버튼(로그인 →
+    카카오계정 직접 입력)을 재시도한다. 타이밍 편차에 강하도록 폴링 방식.
+    """
     deadline = time.time() + timeout
+    last_login_click = 0.0
+    last_direct_click = 0.0
     while time.time() < deadline:
-        if _xp(d, ID_FIELD).exists:
+        if _login_form_present(d):
             _log("카카오계정 로그인 페이지 도달")
             return True
-        xml = _screen_text(d)
-        # kakao 가 이전 계정을 기억한 동의화면 → 다른 계정으로 로그인
+        try:
+            xml = d.dump_hierarchy()
+        except Exception:
+            xml = ""
+        now = time.time()
+
+        # 1) 권한 다이얼로그(알림/위치) 거부
+        for t in PERM_DENY:
+            if f'text="{t}"' in xml:
+                _click_text(d, t)
+                time.sleep(0.8)
+                break
+
+        # 2) Chrome 최초실행(FRE) — '로그아웃 상태 유지' 등
+        for t in CHROME_FRE_DISMISS:
+            if t in xml:
+                _click_text(d, t)
+                _log(f"Chrome 최초실행 통과: {t}")
+                time.sleep(1.5)
+                break
+
+        # 3) 이전 계정 기억한 동의화면 → 다른 계정으로
         if "다른 카카오계정으로 로그인" in xml:
-            _log("동의화면(기억된 계정) — '다른 카카오계정으로 로그인' 클릭")
+            _log("동의화면 — '다른 카카오계정으로 로그인'")
             _click_text(d, "다른 카카오계정으로 로그인")
             time.sleep(2.5)
+            continue
+
+        # 4) 로그인 방식 시트: '카카오계정 직접 입력'
+        if "카카오계정 직접 입력" in xml and (now - last_direct_click) > 3:
+            _click_text(d, "카카오계정 직접 입력")
+            last_direct_click = now
+            time.sleep(2.5)
+            continue
+
+        # 5) 메인 하단 패널 '로그인'
+        if 'text="로그인"' in xml and (now - last_login_click) > 3:
+            _click_text(d, "로그인")
+            last_login_click = now
+            time.sleep(2.0)
+            continue
+
         time.sleep(1.0)
     _log("[!] 로그인 페이지 로딩 실패")
     return False
@@ -209,9 +234,18 @@ def wait_login_result(d: u2.Device, timeout: float = 40.0) -> Tuple[str, str]:
     while time.time() < deadline:
         pkg = _current_pkg(d)
 
-        # 카카오맵으로 복귀 = 로그인 완료
+        # 카카오맵으로 복귀 = 로그인 완료(또는 인증 후 부가화면). 인내심 있게 재확인.
         if pkg == PKG and not _xp(d, ID_FIELD).exists:
-            time.sleep(2.0)
+            for _ in range(6):
+                if _logged_in(d):
+                    return OK, "로그인 성공"
+                # 인증 성공 후 '전화번호 등록/혜택 동의' 등 부가화면 스킵
+                dismissed = False
+                for t in ("다음에 할게요", "나중에", "지금은 아니에요", "건너뛰기"):
+                    if _click_text(d, t):
+                        dismissed = True
+                        break
+                time.sleep(1.5 if dismissed else 1.2)
             if _logged_in(d):
                 return OK, "로그인 성공"
             return FAILED, "카카오맵 복귀했으나 로그인 상태 미확인"
@@ -232,14 +266,22 @@ def wait_login_result(d: u2.Device, timeout: float = 40.0) -> Tuple[str, str]:
 
 
 def _logged_in(d: u2.Device) -> bool:
-    """카카오맵 메인에서 로그인 상태인지. 하단 패널에 '로그인' 이 없으면 로그인됨."""
+    """카카오맵 메인에서 로그인 상태인지. 하단 패널에 '로그인' 이 없으면 로그인됨.
+
+    fresh 진입 직후 하단 패널 로드 지연으로 오탐할 수 있어, 메인이 확실히
+    뜬 상태에서만 판정한다(btn_search 존재 확인).
+    """
     try:
         xml = d.dump_hierarchy()
     except Exception:
         return False
-    if 'text="로그인"' in xml:
+    main = (f'{PKG}:id/btn_search' in xml) or (f'{PKG}:id/query' in xml)
+    if not main:
         return False
-    return f'{PKG}:id/btn_search' in xml or f'{PKG}:id/query' in xml
+    # 로그인 안내가 보이면(하단 '로그인' / 계정 선택 등) 미로그인
+    if 'text="로그인"' in xml or "카카오계정 직접 입력" in xml or "카카오 로그인" in xml:
+        return False
+    return True
 
 
 def is_logged_in(d: u2.Device) -> bool:
@@ -292,12 +334,16 @@ def login(
     *,
     result_timeout: float = 40.0,
     code_fetcher=None,
+    force: bool = False,
 ) -> Tuple[str, str]:
     """카카오맵 로그인 전체 흐름. Returns (result_code, 설명).
 
     앱 데이터 삭제 + IP 변경 직후, 카카오맵 메인이 떠 있는 상태에서 호출한다.
+    force=True 면 로그인 상태 체크를 건너뛰고 무조건 로그인 폼으로 진입한다
+    (pm clear 직후엔 실제로 로그아웃 상태이나 하단 패널 로드 지연으로 _logged_in 이
+    오탐할 수 있으므로).
     """
-    if _logged_in(d):
+    if not force and _logged_in(d):
         _log("이미 로그인 상태 — 건너뜀")
         return OK, "이미 로그인 상태"
 
