@@ -970,11 +970,11 @@ def click_home_tab(d: u2.Device) -> bool:
 # ── 체류형: 풀 상세 탭(홈·사진·후기 등) 클릭 + 스크롤 ─────────────────────
 DETAIL_DWELL_TABS = ("홈", "메뉴", "사진", "후기", "블로그", "랭킹", "정보")
 # 일반트래픽(search): 홈/랭킹/정보 제외 — 메뉴·사진·후기·블로그만
-GENERAL_TRAFFIC_TABS = ("메뉴", "사진", "후기", "블로그")
+GENERAL_TRAFFIC_TABS = ("홈", "메뉴", "사진", "후기", "예약", "혜택소식", "블로그", "랭킹", "정보", "주변")
 DEFAULT_DWELL_MIN = 15.0
 DEFAULT_DWELL_MAX = 20.0
-TAB_Y_MIN_RATIO = 0.28   # 시스템 내비·하단 '도착' 버튼 제외
-TAB_Y_MAX_RATIO = 0.72   # 탭바는 상세 패널 상단~중단
+TAB_Y_MIN_RATIO = 0.20   # 시스템 내비·하단 '도착' 버튼 제외
+TAB_Y_MAX_RATIO = 0.80   # 탭바는 상세 패널 상단~중단
 _DWELL_PATTERN_LOG: list = []   # 최근 로테이션별 탭 방문 기록 (패턴 중복 완화)
 _MAX_DWELL_PATTERN_LOG = 24
 
@@ -1067,6 +1067,26 @@ def click_detail_tab(d: u2.Device, tab_name: str) -> bool:
         except Exception:
             pass
     return False
+
+
+def _scroll_detail_to_top(d: u2.Device, times: int = 3):
+    """상세 본문을 위로 끌어올려 상단 메인 탭바를 다시 노출시킨다."""
+    sx = random.uniform(0.46, 0.54)
+    for _ in range(times):
+        d.swipe(sx, random.uniform(0.30, 0.38), sx, random.uniform(0.70, 0.80),
+                duration=random.uniform(0.30, 0.45))
+        time.sleep(0.25)
+
+
+def _swipe_tabbar_horizontally(d: u2.Device):
+    """탭바(y 대역)를 좌우로 스와이프해 우측 탭(블로그/랭킹 등)을 노출."""
+    _, h = d.window_size()
+    y = h * random.uniform(0.24, 0.34)
+    if random.random() < 0.5:
+        d.swipe(0.75, y / h, 0.25, y / h, duration=0.35)   # 좌로 → 우측탭 노출
+    else:
+        d.swipe(0.25, y / h, 0.75, y / h, duration=0.35)   # 우로 → 좌측탭 복귀
+    time.sleep(0.4)
 
 
 def _scroll_detail_content(d: u2.Device, duration: float = None):
@@ -1169,15 +1189,24 @@ def dwell_on_place_detail(d: u2.Device, min_secs: float = 15.0, max_secs: float 
             visited.append(tab)
             print(f"    탭 클릭 '{tab}' (보임={visible}, {remaining():.1f}s 남음)")
             time.sleep(min(random.uniform(0.45, 1.1), remaining()))
+            # 탭 내부를 잠깐 스크롤하며 체류
             n_scroll = random.randint(1, random.randint(2, 4))
             for _ in range(n_scroll):
                 if remaining() <= 0.2:
                     break
                 _scroll_detail_content(d)
-                time.sleep(min(random.uniform(0.55, 1.6), remaining()))
+                time.sleep(min(random.uniform(0.55, 1.4), remaining()))
+            # 다음 탭을 위해 상단 메인 탭바를 다시 노출 (안 그러면 같은 섹션만 반복)
+            if remaining() > 1.0:
+                _scroll_detail_to_top(d)
+                if random.random() < 0.4:
+                    _swipe_tabbar_horizontally(d)  # 우측 탭(블로그/랭킹) 노출
         else:
-            _scroll_detail_content(d)
-            time.sleep(min(random.uniform(0.7, 1.3), remaining()))
+            # 탭을 못 찾으면 상단으로 올려 탭바 재노출 후 재시도
+            _scroll_detail_to_top(d, times=2)
+            if random.random() < 0.5:
+                _swipe_tabbar_horizontally(d)
+            time.sleep(min(random.uniform(0.5, 1.0), remaining()))
 
     if visited:
         _DWELL_PATTERN_LOG.append(tuple(visited))
@@ -1204,14 +1233,21 @@ def general_traffic_from_detail(
         f"[*] 일반트래픽 시작 (도착 미사용, 체류 {dwell_min:.0f}~{dwell_max:.0f}s, "
         f"탭={list(GENERAL_TRAFFIC_TABS)})"
     )
-    if not click_place_name_on_detail(d, name, partial=partial, fast=True):
-        return False
-    # 풀 상세 탭바(메뉴/사진/후기/블로그)가 뜰 때까지 대기
-    deadline = time.time() + 5.0
+    # 업체명 클릭으로 풀 상세 확장 시도(실패해도 진행 — 이미 탭이 있을 수 있음)
+    clicked_name = click_place_name_on_detail(d, name, partial=partial, fast=True)
+    if not clicked_name:
+        print("[*] 업체명 클릭 실패 — 현재 상세에서 탭 확인 후 진행")
+    # 풀 상세 탭바가 뜰 때까지 대기(스크롤로 상단 노출도 시도)
+    deadline = time.time() + 8.0
+    tabbar = False
     while time.time() < deadline:
         if _collect_visible_tabs(d, GENERAL_TRAFFIC_TABS):
+            tabbar = True
             break
-        time.sleep(0.3)
+        _scroll_detail_to_top(d, times=1)
+        time.sleep(0.4)
+    if not tabbar:
+        print("[!] 상세 탭바 미확인 — 그래도 체류 시도(스크롤 위주)")
     return dwell_on_place_detail(
         d,
         min_secs=dwell_min,
