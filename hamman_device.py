@@ -637,10 +637,34 @@ def wait_search_results(d: u2.Device, keyword: str, timeout: float = 14.0) -> bo
     return False
 
 
+def _debug_shot(d: u2.Device, tag: str) -> None:
+    """실패 순간 화면 캡처 저장 (원인 추적용). campaign_web/logs/shots/ 에 남는다."""
+    try:
+        from pathlib import Path
+        import device_stats as _dstat
+        out = Path(__file__).resolve().parent / "campaign_web" / "logs" / "shots"
+        out.mkdir(parents=True, exist_ok=True)
+        serial = getattr(d, "serial", "") or ""
+        img = _dstat.screenshot_jpeg_b64(serial, width=540, quality=70)
+        if not img:
+            return
+        import base64, time as _t
+        f = out / f"{_t.strftime('%m%d_%H%M%S')}_{serial}_{tag}.jpg"
+        f.write_bytes(base64.b64decode(img))
+        # 오래된 캡처 정리 (최근 60장만)
+        shots = sorted(out.glob("*.jpg"))
+        for old in shots[:-60]:
+            old.unlink(missing_ok=True)
+        log(f"[*] 실패 화면 저장: {f.name}")
+    except Exception:
+        pass
+
+
 def search_on_naver(d: u2.Device, keyword: str) -> bool:
     """네이버 검색창에만 붙여넣기 검색 (Chrome 옴니박스/URL 해킹 없음)."""
     log(f"[*] 네이버 검색창 붙여넣기: '{keyword}'")
     if not focus_naver_search(d, timeout=8.0):
+        _debug_shot(d, "no_search_box")
         raise RuntimeError("네이버 검색창을 찾지 못했습니다.")
     if not paste_into_naver_search(d, keyword):
         raise RuntimeError("네이버 검색창 붙여넣기 실패(주소창 회피)")
