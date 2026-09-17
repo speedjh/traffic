@@ -165,7 +165,8 @@ def build_command(
         )
         dwell_min = params.get("dwell_min", 15)
         dwell_max = params.get("dwell_max", 20)
-        cmd = [str(root / "run_hamman.sh"), keyword, *common]
+        # .sh 래퍼는 Windows 에서 실행 불가 → 파이썬 스크립트를 직접 호출
+        cmd = [sys.executable or "python", str(root / "hamman_device.py"), keyword, *common]
         if kw2:
             cmd.extend(["--keyword2", str(kw2)])
         cmd.extend(["--dwell-min", str(dwell_min), "--dwell-max", str(dwell_max)])

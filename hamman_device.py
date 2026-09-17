@@ -74,10 +74,22 @@ NAVER_HOST_HINTS = ("naver.com", "search.naver")
 CHROME_FRE_TEXTS = (
     "로그아웃 상태 유지",
     "로그인 없이 사용",
+    "계정 없이 사용",          # Chrome 신버전 FRE ("나만의 Chrome 만들기")
+    "계정 없이 계속",
     "Without an account",
     "Use without an account",
+    "Continue without an account",
     "Accept & continue",
     "동의하고 계속",
+    "동의 및 계속",
+)
+
+# Chrome 온보딩 버튼 resource-id (문구가 바뀌어도 잡히도록)
+CHROME_FRE_IDS = (
+    "signin_fre_dismiss_button",   # 계정 없이 사용
+    "more_button",                 # 광고 개인정보 안내 — 자세히
+    "ack_button",                  # 광고 개인정보 안내 — 확인
+    "negative_button",
 )
 
 AD_HINTS = (
@@ -251,6 +263,15 @@ def dismiss_chrome_noise(d: u2.Device, rounds: int = 6) -> None:
     """Chrome FRE / 알림권한 / 공통 팝업 거부."""
     for _ in range(rounds):
         hit = False
+        # 신버전 FRE 순서: '계정 없이 사용' → 광고 개인정보 안내 '자세히' → '확인'
+        for rid in CHROME_FRE_IDS:
+            if ds._safe_click(d, resourceId=f"{CHROME_PKG}:id/{rid}"):
+                log(f"[*] Chrome 온보딩 버튼: {rid}")
+                time.sleep(1.0)
+                hit = True
+                break
+        if hit:
+            continue
         for t in CHROME_FRE_TEXTS:
             if ds._safe_click(d, text=t) or ds._safe_click(d, textContains=t):
                 log(f"[*] Chrome 온보딩: '{t}'")

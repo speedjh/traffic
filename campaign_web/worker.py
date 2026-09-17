@@ -31,6 +31,11 @@ except ImportError:
     _sys.path.insert(0, str(ROOT_DIR))
     from device_screen import ensure_screen_ready, keep_screen_on
 
+import sys as _sys2
+if str(ROOT_DIR) not in _sys2.path:
+    _sys2.path.insert(0, str(ROOT_DIR))
+import device_stats as dstat
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -43,8 +48,7 @@ def log(msg: str):
 
 
 def _adb_bin() -> str:
-    local = ROOT_DIR / "platform-tools" / "adb"
-    return str(local) if local.is_file() else "adb"
+    return dstat.ADB
 
 
 def adb_device_online(serial: str) -> bool:
@@ -84,21 +88,115 @@ class QueueWorker:
         self.dry_run = dry_run
         self.busy_job_id: Optional[int] = None
         self.leased_account: Optional[Dict[str, Any]] = None
+        self.paused = False
+        self.budget: Dict[str, Any] = {}
+        self.pending_events: List[Dict[str, str]] = []
+        self.last_shot = 0.0
+        self.state = "idle"
+        self.state_detail = ""
+        self.last_battery: Optional[int] = None
+
+    def event(self, kind: str, message: str = ""):
+        """대시보드 이벤트 로그 (다음 heartbeat 에 함께 전송)."""
+        log(f"[event] {kind} {message}".rstrip())
+        self.pending_events.append({"kind": kind, "message": message[:300]})
 
     def heartbeat(self):
+        """상태·유심 데이터 카운터 보고 → 일시정지/데이터예산/원격명령 수신."""
+        payload: Dict[str, Any] = {
+            "serial": self.serial,
+            "host": self.host,
+            "worker_id": self.worker_id,
+            "busy_job_id": self.busy_job_id,
+            "state": self.state,
+            "state_detail": self.state_detail,
+        }
         try:
-            httpx.post(
-                f"{self.api}/api/devices/heartbeat",
-                json={
-                    "serial": self.serial,
-                    "host": self.host,
-                    "worker_id": self.worker_id,
-                    "busy_job_id": self.busy_job_id,
-                },
-                timeout=10.0,
-            )
+            payload.update(dstat.device_info(self.serial))
+            payload["data_counter"] = dstat.data_counter(self.serial)
+        except Exception as e:
+            log(f"[!] 기기 상태 수집 실패: {e}")
+        if self.pending_events:
+            payload["events"] = self.pending_events[:10]
+        try:
+            r = httpx.post(f"{self.api}/api/devices/heartbeat", json=payload, timeout=15.0)
+            r.raise_for_status()
+            data = r.json()
         except Exception as e:
             log(f"[!] heartbeat 실패: {e}")
+            return
+        # 전송 성공한 이벤트만 비움
+        if self.pending_events:
+            self.pending_events = self.pending_events[10:]
+        self.paused = bool(data.get("paused"))
+        self.budget = data.get("budget") or {}
+        bat = payload.get("battery")
+        if isinstance(bat, int):
+            self.last_battery = bat
+        if isinstance(bat, int) and bat <= 15 and not payload.get("charging"):
+            self.event("battery_low", f"배터리 {bat}% · 충전 안 됨")
+        for cmd in data.get("commands") or []:
+            self.exec_command(cmd)
+
+    # ── 원격 명령 (대시보드 → 기기) ────────────────────────────────────
+    def exec_command(self, cmd: Dict[str, Any]):
+        name = str(cmd.get("cmd") or "")
+        cid = cmd.get("id")
+        log(f"[*] 원격 명령: {name}")
+        ok, result = True, ""
+        try:
+            if name == "wake":
+                ensure_screen_ready(self.serial, log=log)
+                dstat.clear_screen_blockers(self.serial, log=log)
+            elif name == "home":
+                subprocess.run([_adb_bin(), "-s", self.serial, "shell", "input", "keyevent", "KEYCODE_HOME"], timeout=15)
+            elif name == "back":
+                subprocess.run([_adb_bin(), "-s", self.serial, "shell", "input", "keyevent", "KEYCODE_BACK"], timeout=15)
+            elif name == "screenshot":
+                result = "업로드 " + ("성공" if self.upload_screenshot(force=True) else "실패")
+            elif name == "screen_fix":
+                result = dstat.clear_screen_blockers(self.serial, log=log) or "방해 요소 없음"
+            elif name == "data_toggle":
+                dstat.toggle_data(self.serial)
+                result = "IP 변경 시도"
+            elif name == "reboot":
+                dstat.reboot(self.serial)
+                result = "재부팅 명령 전송"
+            elif name == "stop_job":
+                result = "미지원(실행 중 작업은 타임아웃까지 대기)"
+                ok = False
+            else:
+                ok, result = False, "알 수 없는 명령"
+        except Exception as e:
+            ok, result = False, str(e)[:200]
+        if cid is not None:
+            try:
+                httpx.post(f"{self.api}/api/devices/{self.serial}/cmd/{cid}/done",
+                           json={"ok": ok, "result": result}, timeout=10.0)
+            except Exception:
+                pass
+
+    def upload_screenshot(self, force: bool = False) -> bool:
+        """축소 캡처 업로드 (PC 회선 사용 — 유심 데이터와 무관)."""
+        if not force and time.time() - self.last_shot < 45:
+            return False
+        self.last_shot = time.time()
+        img = dstat.screenshot_jpeg_b64(self.serial)
+        if not img:
+            return False
+        try:
+            httpx.post(f"{self.api}/api/devices/{self.serial}/screenshot",
+                       json={"image": img}, timeout=25.0)
+            return True
+        except Exception as e:
+            log(f"[!] 캡처 업로드 실패: {e}")
+            return False
+
+    def data_used_bytes(self) -> Optional[int]:
+        try:
+            return dstat.data_counter(self.serial)
+        except Exception:
+            return None
 
     def claim(self) -> Optional[Dict[str, Any]]:
         r = httpx.post(
@@ -113,7 +211,8 @@ class QueueWorker:
         r.raise_for_status()
         return r.json().get("job")
 
-    def report(self, job_id: int, status: str, error: str = "", log_path: str = ""):
+    def report(self, job_id: int, status: str, error: str = "", log_path: str = "",
+               bytes_used: Optional[int] = None, duration_secs: Optional[float] = None):
         httpx.post(
             f"{self.api}/api/worker/jobs/{job_id}/report",
             json={
@@ -122,6 +221,8 @@ class QueueWorker:
                 "status": status,
                 "error_message": error or None,
                 "log_path": log_path or None,
+                "bytes_used": bytes_used,
+                "duration_secs": duration_secs,
             },
             timeout=30.0,
         ).raise_for_status()
@@ -231,29 +332,40 @@ class QueueWorker:
         self.report_account(account["id"], result, detail)
 
     def run_job(self, job: Dict[str, Any]) -> tuple:
+        """returns (status, error, log_path, bytes_used, duration_secs)"""
+        started = time.time()
+        bytes_before = self.data_used_bytes()
+
+        def done(status: str, err: str = "", lp: str = "") -> tuple:
+            after = self.data_used_bytes()
+            used = None
+            if bytes_before is not None and after is not None and after >= bytes_before:
+                used = after - bytes_before
+            return status, err, lp, used, round(time.time() - started, 1)
+
         job_id = job["id"]
         traffic = job["traffic_type"]
         if not adb_device_online(self.serial):
             log(f"[!] adb offline — job#{job_id} 실행 보류")
-            return "release", "device offline", ""
+            return done("release", "device offline")
         try:
             ensure_screen_ready(self.serial, log=log)
         except Exception as e:
             log(f"[!] 화면 준비 실패: {e}")
         if not adb_device_online(self.serial):
-            return "release", "device offline", ""
+            return done("release", "device offline")
         if not self.job_runnable(job_id):
             log(f"[*] job#{job_id} 캠페인 중단 — 실행 스킵")
-            return "failed", "campaign paused", ""
+            return done("failed", "campaign paused")
         if not self.mark_start(job_id):
             log(f"[*] job#{job_id} 큐에서 제외됨 — 실행 스킵")
-            return "failed", "job reclaimed", ""
+            return done("failed", "job reclaimed")
         account: Optional[Dict[str, Any]] = None
         if needs_account(traffic):
             account = self.lease_account(job_id)
             if not account:
                 log(f"[!] 사용 가능한 카카오 계정 없음 — job#{job_id} 보류")
-                return "release", "no kakao account available", ""
+                return done("release", "no kakao account available")
             account["api"] = self.api
             self.leased_account = account
             log(f"[*] 계정 리스: {account['email']} (id={account['id']})")
@@ -276,10 +388,13 @@ class QueueWorker:
         if self.dry_run:
             log(f"[dry-run] skip execute, pretend success")
             log_path.write_text(f"DRY RUN\n{' '.join(cmd)}\n", encoding="utf-8")
-            return "success", "", str(log_path)
+            return done("success", "", str(log_path))
 
         env = os.environ.copy()
         env["PATH"] = f"{ROOT_DIR / 'platform-tools'}{os.pathsep}" + env.get("PATH", "")
+        # Windows 기본 cp949 로는 한글 로그 출력이 깨지거나 죽는다
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         with open(log_path, "w", encoding="utf-8") as lf:
             lf.write(f"$ {' '.join(cmd)}\n\n")
             lf.flush()
@@ -308,7 +423,7 @@ class QueueWorker:
                             os.killpg(proc.pid, 9)
                         except Exception:
                             pass
-                    return "failed", "timeout", str(log_path)
+                    return done("failed", "timeout", str(log_path))
                 ok = rc == 0
                 # 기기 단절 traceback 은 fail 소진 대신 재시도
                 if not ok:
@@ -321,8 +436,8 @@ class QueueWorker:
                         or "device offline" in body.lower()
                         or ("device '" in body and "not found" in body)
                     ):
-                        return "release", "device offline", str(log_path)
-                return ("success" if ok else "failed", "" if ok else f"exit={rc}", str(log_path))
+                        return done("release", "device offline", str(log_path))
+                return done("success" if ok else "failed", "" if ok else f"exit={rc}", str(log_path))
             except Exception as e:
                 if proc and proc.poll() is None:
                     try:
@@ -332,51 +447,123 @@ class QueueWorker:
                             proc.kill()
                         except Exception:
                             pass
-                return "failed", str(e), str(log_path)
+                return done("failed", str(e), str(log_path))
+
+    # ── 화면 감시 스레드: 꺼지면 강제로 켜고, 방해 창은 치운다 ──────────
+    def screen_watchdog(self, stop: threading.Event):
+        while not stop.wait(25.0):
+            try:
+                if not adb_device_online(self.serial):
+                    continue
+                info = dstat.device_info(self.serial)
+                if not info.get("screen_on"):
+                    self.event("screen_off", "화면 꺼짐 감지 → 강제 켜기")
+                    keep_screen_on(self.serial)
+                    ensure_screen_ready(self.serial, log=log)
+                blocked = dstat.clear_screen_blockers(self.serial, log=log)
+                if blocked:
+                    self.event("screen_blocker", blocked)
+                self.upload_screenshot()
+            except Exception as e:
+                log(f"[!] 화면 감시 오류: {e}")
+
+    # ── 유심 데이터 예산 ──────────────────────────────────────────────
+    def budget_hold_secs(self) -> float:
+        """예산 초과면 대기할 초. 0 이면 작업 가능."""
+        b = self.budget or {}
+        if not b.get("over"):
+            return 0.0
+        return float(min(max(b.get("wait_secs") or 60, 30), 600))
 
     def loop(self):
         log(f"[*] worker start serial={self.serial} id={self.worker_id} api={self.api}")
         offline_logged = False
         try:
             if adb_device_online(self.serial):
+                dstat.disable_pocket_mode(self.serial)
                 keep_screen_on(self.serial)
                 ensure_screen_ready(self.serial, log=log)
-                log("[+] 화면 유지 설정 적용 (USB stay-on + 긴 timeout)")
+                dstat.clear_screen_blockers(self.serial, log=log)
+                dstat.dim_screen(self.serial)
+                log("[+] 화면 유지 설정 적용 (USB stay-on + 오동작방지 해제 + 밝기 최소)")
+                self.event("worker_start", f"{self.host} 워커 기동")
             else:
                 log("[!] adb 기기 미연결 — USB 디버깅/파일전송 모드 확인 필요")
         except Exception as e:
             log(f"[!] 화면 유지 초기화 실패: {e}")
-        idle_ticks = 0
+
+        stop_wd = threading.Event()
+        threading.Thread(target=self.screen_watchdog, args=(stop_wd,),
+                         name="screen-watchdog", daemon=True).start()
+        hold_logged = ""
         while True:
             try:
                 self.heartbeat()
                 if not adb_device_online(self.serial):
                     if not offline_logged:
                         log("[!] adb offline — claim 중지 (실패 소진 방지). 폰 USB 연결·디버깅 허용 후 대기")
+                        self.event("device_offline", "adb 연결 끊김 — 작업 중지")
                         offline_logged = True
+                    self.state, self.state_detail = "offline", "adb 연결 끊김"
                     time.sleep(max(self.poll_secs, 8.0))
                     continue
                 if offline_logged:
                     log("[+] adb 재연결 감지")
+                    self.event("device_online", "adb 재연결 — 작업 재개")
                     offline_logged = False
                     try:
+                        dstat.disable_pocket_mode(self.serial)
                         keep_screen_on(self.serial)
                         ensure_screen_ready(self.serial, log=log)
                     except Exception as e:
                         log(f"[!] 재연결 후 화면 준비 실패: {e}")
-                # 유휴 중에도 주기적으로 화면 유지/깨우기
-                idle_ticks += 1
-                if idle_ticks % 20 == 1:  # ~1분 (poll 3s)
-                    try:
-                        ensure_screen_ready(self.serial, log=log)
-                    except Exception as e:
-                        log(f"[!] 화면 점검 실패: {e}")
+
+                bat = self.last_battery
+                if bat is not None and bat <= 10:
+                    if hold_logged != "battery":
+                        log(f"[*] 배터리 {bat}% — 방전 방지로 작업 보류 (20% 회복 시 재개)")
+                        self.event("battery_hold", f"배터리 {bat}% — 작업 보류")
+                        hold_logged = "battery"
+                    self.state, self.state_detail = "hold", f"배터리 부족 {bat}%"
+                    time.sleep(120.0)
+                    continue
+                if hold_logged == "battery" and bat is not None and bat >= 20:
+                    self.event("battery_resume", f"배터리 {bat}% — 작업 재개")
+                    hold_logged = ""
+
+                if self.paused:
+                    if hold_logged != "paused":
+                        log("[*] 대시보드에서 일시정지됨 — 대기")
+                        hold_logged = "paused"
+                    self.state, self.state_detail = "hold", "대시보드 일시정지"
+                    time.sleep(15.0)
+                    continue
+
+                hold = self.budget_hold_secs()
+                if hold:
+                    b = self.budget
+                    key = "cap" if b.get("exhausted") else "pace"
+                    if hold_logged != key:
+                        log(f"[*] 유심 데이터 {b.get('used_mb')}MB / {b.get('cap_mb')}MB "
+                            f"(지금 허용 {b.get('pace_mb')}MB) → {int(hold)}초 대기")
+                        if key == "cap":
+                            self.event("data_cap", f"1일 한도 도달 {b.get('used_mb')}MB — 자정까지 정지")
+                        hold_logged = key
+                    self.state = "hold"
+                    self.state_detail = ("1일 데이터 한도 도달" if key == "cap"
+                                         else f"데이터 페이스 대기 ({b.get('used_mb')}/{b.get('pace_mb')}MB)")
+                    time.sleep(min(hold, 60.0))
+                    continue
+                hold_logged = ""
+
                 job = self.claim()
                 if not job:
+                    self.state, self.state_detail = "idle", "대기 중(작업 없음)"
                     time.sleep(self.poll_secs)
                     continue
-                idle_ticks = 0
                 self.busy_job_id = job["id"]
+                self.state = "running"
+                self.state_detail = f"{job.get('campaign_name','')} · {job.get('traffic_type','')}"
                 # job 실행 중에도 heartbeat 유지 (워치독이 stale 로 죽이지 않게)
                 stop_hb = threading.Event()
 
@@ -390,7 +577,7 @@ class QueueWorker:
                 hb_thread.start()
                 try:
                     self.heartbeat()
-                    status, err, log_path = self.run_job(job)
+                    status, err, log_path, used, secs = self.run_job(job)
                 finally:
                     stop_hb.set()
                     hb_thread.join(timeout=2.0)
@@ -398,11 +585,13 @@ class QueueWorker:
                 if status == "release":
                     self.release_pending(job["id"], err or "device offline")
                 else:
-                    self.report(job["id"], status, err, log_path)
-                    log(f"[+] job#{job['id']} → {status}")
+                    self.report(job["id"], status, err, log_path, used, secs)
+                    mb = f"{used/1048576:.1f}MB" if used is not None else "?"
+                    log(f"[+] job#{job['id']} → {status} ({secs:.0f}s, 데이터 {mb})")
                 self.busy_job_id = None
             except KeyboardInterrupt:
                 log("[*] 중단")
+                stop_wd.set()
                 break
             except Exception as e:
                 log(f"[!] loop error: {e}")
