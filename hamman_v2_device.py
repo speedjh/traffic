@@ -383,6 +383,30 @@ def launch_chrome(d: u2.Device, serial: str) -> Chrome:
     raise RuntimeError("DevTools 탭을 찾지 못했습니다 (USB 디버깅/크롬 상태 확인)")
 
 
+def settle_chrome_ui(d: u2.Device, secs: float = 5.0) -> None:
+    """크롬 초기화 직후 늦게 뜨는 안내창(광고 개인정보 보호 등)을 조용해질 때까지 닫는다.
+    한 번 확인하고 넘어가면 몇 초 뒤 뜬 창이 검색 도중 페이지를 덮는다."""
+    end = time.time() + secs
+    quiet = 0
+    while time.time() < end and quiet < 3:
+        hit = False
+        for rid in v1.CHROME_FRE_IDS:
+            if ds._safe_click(d, resourceId=f"{CHROME_PKG}:id/{rid}"):
+                log(f"[*] Chrome 안내창 닫음: {rid}")
+                hit = True
+                time.sleep(0.8)
+                break
+        if not hit and (ds._safe_exists(d, textContains="광고 개인 정보") or ds._safe_exists(d, textContains="광고 개인정보")):
+            for t in ("확인", "알겠습니다", "Got it"):
+                if ds._safe_click(d, text=t):
+                    log(f"[*] Chrome 광고 개인정보 안내: '{t}'")
+                    hit = True
+                    time.sleep(0.8)
+                    break
+        quiet = 0 if hit else quiet + 1
+        time.sleep(0.4)
+
+
 def reset_identity(ch: Chrome, *, final: bool) -> None:
     """쿠키·스토리지·세션 삭제 (HTTP 캐시는 유지). final=True 면 새 빈 탭으로 교체."""
     c = ch.cdp
@@ -520,7 +544,12 @@ def search_from_home(ch: Chrome, d: u2.Device, keyword: str, tr: Tracer) -> None
     ch.block_images(False)            # 검색결과부터는 이미지 정상 로딩
     ch.phase("serp1")
     d.shell("input keyevent 66")       # 실제 키보드 엔터
-    cur = ch.wait_url(lambda u: "search.naver.com" in u and same_query(query_of(u), keyword), 15)
+    is_serp = lambda u: "search.naver.com" in u and same_query(query_of(u), keyword)  # noqa: E731
+    cur = ch.wait_url(is_serp, 15)
+    if not cur:
+        # 크롬 안내창이 페이지를 덮었을 수 있음 → 닫고 다시 확인
+        settle_chrome_ui(d, 4)
+        cur = ch.wait_url(is_serp, 6)
     if not cur:
         raise RuntimeError(f"검색결과 URL 미확인 ('{keyword}')")
     log(f"[+] 검색결과: {cur[:90]}")
@@ -821,7 +850,7 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
             return False, True, ch
         ch.wait_ready(20)
         time.sleep(random.uniform(1.0, 2.2))
-        v1.dismiss_chrome_noise(d, rounds=1)
+        settle_chrome_ui(d, 6)   # 초기화 직후 늦게 뜨는 크롬 안내창까지 정리
         tr.shot("main")
 
         # 1차
