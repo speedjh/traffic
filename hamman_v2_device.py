@@ -67,6 +67,8 @@ BAD_HOST_SUBSTR = (
     "help.naver.com", "policy.naver.com", "nid.naver.com", "navercorp.com",
     "dict.naver.com", "m.naver.com", "search.naver.com", "talk.naver.com",
     "pay.naver.com", "keep.naver.com", "notify.naver",
+    # 영상·SNS — 자동재생/무거운 페이지로 데이터 낭비
+    "youtube.com", "youtu.be", "instagram.com", "facebook.com", "tiktok.com",
 )
 # 글(우선 클릭) — 경로에 글 번호가 있어야 함 (프로필/카페 홈 제외)
 ARTICLE_RULES = (
