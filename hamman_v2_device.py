@@ -665,6 +665,17 @@ def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
     serp_url = ch.url()
     tried: set = set()
     for attempt in range(4):
+        # 재시도 전에 검색결과 페이지에 있는지 확인 (다른 페이지에서 링크를 고르지 않도록)
+        if attempt and "search.naver.com" not in ch.url():
+            cur = ch.url()
+            if classify(cur) != "bad":
+                log(f"[+] 페이지 진입(지연 확인): {cur[:90]}")
+                ch.wait_ready(15)
+                return True
+            d.press("back")
+            if not ch.wait_url(lambda u: "search.naver.com" in u, 8):
+                log(f"[!] {label}: 검색결과로 복귀 실패")
+                return False
         tgt = None
         st: dict = {}
         for _ in range(10):
@@ -701,6 +712,12 @@ def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
         ch.phase(f"{label}_page")
         ch.tap(x, y)
         cur = ch.wait_url(lambda u: u != serp_url and "search.naver.com" not in u, 12)
+        if not cur:
+            # 느린 기기: 탭은 먹혔지만 전환이 늦는 경우 — 조금 더 기다린 뒤 다시 확인
+            # (여기서 다른 글을 고르면 이미 열린 글 안의 링크를 또 누르게 된다)
+            cur = ch.wait_url(lambda u: u != serp_url and "search.naver.com" not in u, 10)
+            if cur:
+                log("    ... 전환 지연(느린 로딩) — 진입 확인")
         if not cur:
             # 새 탭으로 열린 경우
             for t in ch.pages():
