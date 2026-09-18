@@ -166,10 +166,15 @@ def build_command(
         dwell_min = params.get("dwell_min", 15)
         dwell_max = params.get("dwell_max", 20)
         # .sh 래퍼는 Windows 에서 실행 불가 → 파이썬 스크립트를 직접 호출
-        cmd = [sys.executable or "python", str(root / "hamman_device.py"), keyword, *common]
+        # 캠페인 params.engine == "v2" 면 DevTools 정밀 클릭·데이터 절감판(hamman_v2_device.py)
+        v2 = str(params.get("engine", "")).lower() == "v2"
+        script = "hamman_v2_device.py" if v2 else "hamman_device.py"
+        cmd = [sys.executable or "python", str(root / script), keyword, *common]
         if kw2:
             cmd.extend(["--keyword2", str(kw2)])
         cmd.extend(["--dwell-min", str(dwell_min), "--dwell-max", str(dwell_max)])
+        if v2 and params.get("trace"):
+            cmd.append("--trace")
         return cmd
 
     raise ValueError(f"unknown traffic_type: {traffic_type}")

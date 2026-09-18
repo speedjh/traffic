@@ -55,7 +55,7 @@ def kill_orphan_workers() -> None:
     me = os.getpid()
     ps = (
         "Get-CimInstance Win32_Process -Filter \"name like 'python%'\" | "
-        "Where-Object { $_.CommandLine -match 'campaign_web.worker|hamman_device|kakao_search_device' } | "
+        "Where-Object { $_.CommandLine -match 'campaign_web.worker|hamman_device|hamman_v2_device|kakao_search_device' } | "
         f"Where-Object {{ $_.ProcessId -ne {me} }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }}"
     )
     try:
