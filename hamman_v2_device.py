@@ -482,20 +482,39 @@ def type_and_submit(ch: Chrome, d: u2.Device, keyword: str, input_ids: tuple) ->
 def search_from_home(ch: Chrome, d: u2.Device, keyword: str, tr: Tracer) -> None:
     """m.naver.com 검색창(가짜 입력창 탭 → 실제 입력창) 에 입력 후 검색."""
     log(f"[*] 네이버 메인 검색: '{keyword}'")
-    r = None
-    for _ in range(20):
-        r = rect_of(ch, "#MM_SEARCH_FAKE")
-        if r and r.get("vis"):
-            break
+    # 로딩 중(뼈대 화면)에 누르면 가짜 입력창에 커서만 들어가고 검색 레이어가 안 열린다 → 완전 로딩 대기
+    end = time.time() + 12
+    while time.time() < end:
+        try:
+            if ch.cdp.eval("document.readyState", timeout=4) == "complete":
+                break
+        except Exception:
+            pass
         time.sleep(0.4)
-    if not r or not r.get("vis"):
-        raise RuntimeError("메인 검색창(#MM_SEARCH_FAKE) 없음")
-    time.sleep(random.uniform(0.6, 1.4))
-    ch.tap(r["x"] + random.uniform(-r["w"] * 0.25, r["w"] * 0.25), r["y"] + random.uniform(-4, 4))
-    for _ in range(15):
+    for attempt in range(3):
+        r = None
+        for _ in range(20):
+            r = rect_of(ch, "#MM_SEARCH_FAKE")
+            if r and r.get("vis"):
+                break
+            time.sleep(0.4)
+        if not r or not r.get("vis"):
+            raise RuntimeError("메인 검색창(#MM_SEARCH_FAKE) 없음")
+        time.sleep(random.uniform(0.8, 1.6))
+        ch.tap(r["x"] + random.uniform(-r["w"] * 0.25, r["w"] * 0.25), r["y"] + random.uniform(-4, 4))
+        for _ in range(15):
+            if focused_id(ch) == "query":
+                break
+            time.sleep(0.2)
         if focused_id(ch) == "query":
             break
-        time.sleep(0.2)
+        log(f"    ... 검색 레이어 미전환(focus={focused_id(ch) or '-'}) → 키보드 닫고 재시도 {attempt + 1}/3")
+        tr.shot(f"main_retry{attempt + 1}")
+        d.press("back")          # 키보드 닫기 (페이지 이동 아님)
+        time.sleep(random.uniform(1.5, 2.5))
+        if "m.naver.com" not in ch.url():
+            ch.cdp.send("Page.navigate", {"url": NAVER_HOME_URL, "transitionType": "typed"})
+            ch.wait_ready(15)
     type_and_submit(ch, d, keyword, ("query",))
     tr.shot("main_typed")
     ch.block_images(False)            # 검색결과부터는 이미지 정상 로딩
