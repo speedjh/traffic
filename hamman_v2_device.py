@@ -671,7 +671,11 @@ JS_LOCATE = r"""((href, txt) => {
     const t = (a.innerText || a.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
     if (t !== txt) continue;
     const r = a.getBoundingClientRect(); if (r.width < 10 || r.height < 10) continue;
-    return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, h: innerHeight, w: innerWidth};
+    // 두 줄로 접힌 제목은 전체 사각형에 빈 공간이 생긴다 → 실제 글자 줄(가장 넓은 줄)을 누를 영역으로
+    let box = r, best = 0;
+    for (const lr of a.getClientRects()) { if (lr.width * lr.height > best && lr.height >= 10) { best = lr.width * lr.height; box = lr; } }
+    return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, h: innerHeight, w: innerWidth,
+            tl: box.left, tr: box.right, tt: box.top, tb: box.bottom};
   }
   return null;
 })(%s, %s)"""
@@ -750,8 +754,8 @@ def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
             log("    ... 목표를 화면에 맞추지 못함 → 다른 글")
             continue
         time.sleep(random.uniform(0.5, 1.3))          # 제목 읽는 시간
-        x = loc["left"] + (loc["right"] - loc["left"]) * random.uniform(0.2, 0.7)
-        y = loc["top"] + (loc["bottom"] - loc["top"]) * random.uniform(0.35, 0.65)
+        x = loc["tl"] + (loc["tr"] - loc["tl"]) * random.uniform(0.2, 0.7)
+        y = loc["tt"] + (loc["tb"] - loc["tt"]) * random.uniform(0.35, 0.65)
         hit = ch.cdp.eval(JS_HIT % (x, y, json.dumps(tgt["href"])))
         if hit != "ok":
             log(f"    ... 좌표 검증 실패({hit}) → 재시도")
