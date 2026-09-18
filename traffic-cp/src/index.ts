@@ -574,35 +574,244 @@ app.post('/api/campaigns/:id/activate', async (c) => {
 })
 
 app.post('/api/campaigns/:id/pause', async (c) => {
-  const id = Number(c.req.param('id'))
-  await c.env.DB.prepare(`UPDATE campaigns SET status='paused' WHERE id=?`).bind(id).run()
-  await c.env.DB.prepare(`UPDATE jobs SET status='paused' WHERE campaign_id=? AND status='pending'`).bind(id).run()
+  await pauseCampaign(c.env.DB, Number(c.req.param('id')))
   return c.json({ ok: true })
 })
+
+// ── 캠페인 큐 유지 (campaign_web scheduler 이식) ─────────────────────────
+const campaignEnd = (camp: any) => addDays(camp.start_date, Math.max(camp.days, 1) - 1)
+
+/** 기간 밖·지난 날짜의 대기 job 을 지우고, 오늘~종료일 각 날짜 job 수를 일유입량에 맞춘다. */
+async function syncCampaignJobs(db: D1Database, id: number) {
+  const camp = await db.prepare('SELECT * FROM campaigns WHERE id=?').bind(id).first<any>()
+  if (!camp) return
+  const today = kstToday(), end = campaignEnd(camp)
+  await db.prepare(`DELETE FROM jobs WHERE campaign_id=? AND status IN ('pending','paused')
+      AND (schedule_date<? OR schedule_date>? OR schedule_date<?)`).bind(id, camp.start_date, end, today).run()
+  if (camp.status !== 'active') return
+  const cnt = await db.prepare(`SELECT schedule_date d, COUNT(*) n FROM jobs WHERE campaign_id=? AND status!='paused'
+      AND schedule_date BETWEEN ? AND ? GROUP BY schedule_date`).bind(id, today, end).all()
+  const have = new Map((cnt.results || []).map((r: any) => [r.d, r.n]))
+  for (let day = camp.start_date > today ? camp.start_date : today; day <= end; day = addDays(day, 1)) {
+    const diff = camp.daily_quota - (have.get(day) ?? 0)
+    if (diff > 0) {
+      const seqBase = (await db.prepare('SELECT COALESCE(MAX(queue_seq),0) m FROM jobs WHERE schedule_date=?').bind(day).first<any>())?.m ?? 0
+      const stmts = []
+      for (let i = 0; i < diff; i++)
+        stmts.push(db.prepare('INSERT INTO jobs (campaign_id,schedule_date,queue_seq,status) VALUES (?,?,?,?)').bind(id, day, seqBase + i + 1, 'pending'))
+      for (let i = 0; i < stmts.length; i += 500) await db.batch(stmts.slice(i, i + 500))
+    } else if (diff < 0) {
+      await db.prepare(`DELETE FROM jobs WHERE id IN (SELECT id FROM jobs WHERE campaign_id=? AND schedule_date=? AND status='pending'
+          ORDER BY queue_seq DESC LIMIT ?)`).bind(id, day, -diff).run()
+    }
+  }
+}
+
+/** 중단(일시정지): 남은 대기/리스 job 을 paused 로 보관. 실행 중 job 은 워커 runnable 검사에서 멈춘다. */
+async function pauseCampaign(db: D1Database, id: number) {
+  await db.prepare(`UPDATE campaigns SET status='paused', updated_at=? WHERE id=?`).bind(nowIso(), id).run()
+  await db.prepare(`UPDATE jobs SET status='paused', device_serial=NULL, worker_id=NULL, leased_at=NULL
+      WHERE campaign_id=? AND status IN ('pending','leased')`).bind(id).run()
+}
+
+/** 재개: 오늘부터 N일로 기간을 새로 잡고 이전 대기분을 정리한 뒤 큐 생성. */
+async function resumeCampaign(db: D1Database, id: number, quota: number, days: number) {
+  if (!(quota >= 1 && days >= 1 && days <= 365)) throw new Error('일유입량·일수는 1 이상이어야 합니다 (일수 최대 365)')
+  await db.prepare(`DELETE FROM jobs WHERE campaign_id=? AND status IN ('pending','paused','leased')`).bind(id).run()
+  await db.prepare(`UPDATE campaigns SET status='active', daily_quota=?, days=?, start_date=?, updated_at=? WHERE id=?`)
+    .bind(quota, days, kstToday(), nowIso(), id).run()
+  await syncCampaignJobs(db, id)
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // 대시보드 (HTML)
 // ══════════════════════════════════════════════════════════════════════════
-app.get('/', (c) => c.html(page('대시보드', dashHtml())))
-app.get('/accounts', (c) => c.html(page('카카오 계정', accountsHtml())))
-app.get('/campaigns', (c) => c.html(page('캠페인', campaignsHtml())))
-app.get('/devices', (c) => c.html(page('기기관리', devicesHtml())))
+// 트래픽 종류 (campaign_web/traffic.py TRAFFIC_TYPES 와 동일)
+const TRAFFIC_TYPES: { key: string; label: string; description: string }[] = [
+  { key: 'daum_jawan', label: '다음 자완', description: '다음앱 검색 후 파워링크·관련검색어·장소 제외, 결과 글(블로그/웹/뉴스 등)을 클릭합니다.' },
+  { key: 'daum_click', label: '다음 클릭형', description: '다음앱 검색 → 장소(플레이스) 클릭 → 카카오맵 전환만 확인하고 종료합니다. 맵 안 추가 액션 없음.' },
+  { key: 'daum_dwell', label: '다음 체류형', description: '다음앱에서 장소 클릭 후 카카오맵으로 들어가 업체 상세 탭을 클릭·스크롤하며 체류합니다.' },
+  { key: 'daum_full', label: '다음 풀플로우', description: '다음앱 장소 클릭 → 카카오맵 전환 + 업체 클릭 + 상세 스크롤까지 수행합니다.' },
+  { key: 'gs_click', label: '우리동네GS 클릭', description: '우리동네GS 앱에서 하단 검색 → 키워드 입력 → GS25배달 구역 상품 1개를 클릭합니다.' },
+  { key: 'kakao_search', label: '카카오맵 일반트래픽', description: "카카오맵 검색 → 업체 진입 → 업체명 클릭 후 메뉴/사진/후기/블로그를 랜덤 클릭·스크롤하며 체류합니다. 앱 데이터 삭제·IP 변경 후 진입할 때 카카오 계정으로 로그인하며, 로테이션마다 '투입이 가장 오래된' 계정으로 교체됩니다. 체류시간은 캠페인에서 설정." },
+  { key: 'kakao_route', label: '카카오맵 길찾기', description: '카카오맵 앱을 직접 켜고 검색 → 업체 진입 → 도착 → 출발지 입력 → 경로 결과까지 진행합니다.' },
+  { key: 'hamman_find', label: '함많찾을', description: 'Chrome에서 네이버 검색 → 결과 클릭·체류 → 2차 키워드 검색·클릭·체류 → Chrome 초기화 → IP 변경.' },
+]
+const trafficLabel = (k: string) => TRAFFIC_TYPES.find((t) => t.key === k)?.label ?? k
+const DWELL_TYPES = ['kakao_search', 'hamman_find']
 
-const page = (title: string, body: string) => `<!doctype html><html lang="ko"><head>
+const esc = (s: any) => String(s ?? '').replace(/[&<>"']/g, (ch) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as any)[ch])
+const badge = (s: string) => `<span class="badge ${esc(s)}">${esc(s)}</span>`
+/** KST 하루를 finished_at(UTC 문자열) 비교 범위로 변환 */
+function kstDayUtcRange(day: string): [string, string] {
+  const s = new Date(day + 'T00:00:00Z').getTime() - KST_OFFSET
+  const f = (t: number) => new Date(t).toISOString().replace('T', ' ').slice(0, 19)
+  return [f(s), f(s + 86400000)]
+}
+const toNum = (v: any) => (v === undefined || v === null || String(v).trim() === '' ? null : Number(v))
+
+app.get('/', async (c) => c.html(page('대시보드', await dashHtml(c.env.DB), '/')))
+app.get('/accounts', (c) => c.html(page('카카오 계정', accountsHtml(), '/accounts')))
+app.get('/campaigns', (c) => c.redirect('/', 302))
+app.get('/devices', (c) => c.html(page('기기관리', devicesHtml(), '/devices')))
+
+// ── 캠페인 생성 ──
+app.get('/campaigns/new', (c) => c.html(page('캠페인 생성', campaignFormHtml(null), '/campaigns/new')))
+app.post('/campaigns/new', async (c) => {
+  const f: any = await c.req.parseBody()
+  try {
+    const name = String(f.name || '').trim(), type = String(f.traffic_type || '')
+    const quota = Number(f.daily_quota), days = Number(f.days), start = String(f.start_date || kstToday())
+    if (!name) throw new Error('캠페인 이름을 입력하세요')
+    if (!TRAFFIC_TYPES.some((t) => t.key === type)) throw new Error('지원하지 않는 트래픽 종류')
+    if (!(quota >= 1 && days >= 1 && days <= 365)) throw new Error('일유입량·일수는 1 이상이어야 합니다 (일수 최대 365)')
+    const placeName = String(f.place_name || '').trim()
+    const params: any = {}
+    if (DWELL_TYPES.includes(type)) {
+      let dmin = toNum(f.dwell_min) ?? 15, dmax = toNum(f.dwell_max) ?? 20
+      if (dmax < dmin) [dmin, dmax] = [dmax, dmin]
+      params.dwell_min = dmin; params.dwell_max = dmax
+      if (type === 'hamman_find' && placeName) params.keyword2 = placeName
+    }
+    const r = await c.env.DB.prepare(`INSERT INTO campaigns (name,traffic_type,keyword,place_url,place_name,daily_quota,start_date,days,status,params_json)
+       VALUES (?,?,?,?,?,?,?,?, 'active', ?)`).bind(name, type, String(f.keyword || '').trim(), String(f.place_url || '').trim(),
+      placeName, quota, start, days, JSON.stringify(params)).run()
+    await syncCampaignJobs(c.env.DB, Number(r.meta.last_row_id))
+    return c.redirect('/', 303)
+  } catch (e: any) {
+    return c.html(page('캠페인 생성', campaignFormHtml(e.message || String(e)), '/campaigns/new'), 400)
+  }
+})
+
+// ── 캠페인 상세 / 설정 수정 ──
+app.get('/campaigns/:id', async (c) => {
+  const html = await campaignDetailHtml(c.env.DB, Number(c.req.param('id')), c.req.query('applied') ? '변경사항이 즉시 반영됩니다.' : null, null)
+  return html ? c.html(page('캠페인 설정', html, '')) : c.text('campaign not found', 404)
+})
+app.post('/campaigns/:id/settings', async (c) => {
+  const id = Number(c.req.param('id')), db = c.env.DB
+  const f: any = await c.req.parseBody()
+  const camp = await db.prepare('SELECT * FROM campaigns WHERE id=?').bind(id).first<any>()
+  if (!camp) return c.text('campaign not found', 404)
+  try {
+    if (!['active', 'paused'].includes(camp.status)) throw new Error('진행 중이거나 일시정지된 캠페인만 수정할 수 있습니다')
+    const params = JSON.parse(camp.params_json || '{}')
+    const sets: string[] = [], vals: any[] = []
+    let pacing = false
+    if (f.daily_quota !== undefined || f.days !== undefined) {
+      const quota = toNum(f.daily_quota) ?? camp.daily_quota, days = toNum(f.days) ?? camp.days
+      if (!(quota >= 1 && days >= 1 && days <= 365)) throw new Error('일유입량·일수는 1 이상이어야 합니다 (일수 최대 365)')
+      sets.push('daily_quota=?', 'days=?'); vals.push(quota, days); pacing = true
+    }
+    if (f.keyword !== undefined) { sets.push('keyword=?'); vals.push(String(f.keyword).trim()) }
+    if (f.place_url !== undefined) { sets.push('place_url=?'); vals.push(String(f.place_url).trim()) }
+    const dual = f.keyword2 !== undefined ? f.keyword2 : f.place_name
+    let touchedParams = false
+    if (dual !== undefined) {
+      const v = String(dual).trim()
+      sets.push('place_name=?'); vals.push(v)
+      if (camp.traffic_type === 'hamman_find' || 'keyword2' in params) {
+        if (v) params.keyword2 = v; else delete params.keyword2
+        touchedParams = true
+      }
+    }
+    const dmin = toNum(f.dwell_min), dmax = toNum(f.dwell_max)
+    if (dmin !== null || dmax !== null) {
+      let a = dmin ?? Number(params.dwell_min ?? 15), b = dmax ?? Number(params.dwell_max ?? 20)
+      if (b < a) [a, b] = [b, a]
+      params.dwell_min = a; params.dwell_max = b; touchedParams = true
+    }
+    if (touchedParams) { sets.push('params_json=?'); vals.push(JSON.stringify(params)) }
+    if (!sets.length) throw new Error('변경할 항목이 없습니다')
+    sets.push('updated_at=?'); vals.push(nowIso())
+    await db.prepare(`UPDATE campaigns SET ${sets.join(',')} WHERE id=?`).bind(...vals, id).run()
+    if (pacing) {
+      await expirePastCampaigns(db)
+      await syncCampaignJobs(db, id)
+    }
+    return c.redirect(`/campaigns/${id}?applied=1`, 303)
+  } catch (e: any) {
+    return c.html(page('캠페인 설정', (await campaignDetailHtml(db, id, null, e.message || String(e)))!, ''), 400)
+  }
+})
+
+// ── 중단 / 재개 ──
+app.post('/campaigns/:id/pause', async (c) => {
+  await pauseCampaign(c.env.DB, Number(c.req.param('id')))
+  return c.redirect('/', 303)
+})
+app.get('/campaigns/:id/resume', async (c) => {
+  const id = Number(c.req.param('id'))
+  const camp = await c.env.DB.prepare('SELECT * FROM campaigns WHERE id=?').bind(id).first<any>()
+  if (!camp) return c.text('campaign not found', 404)
+  if (!['paused', 'stopped'].includes(camp.status)) return c.redirect(`/campaigns/${id}`, 303)
+  return c.html(page('캠페인 재개', resumeHtml(camp, null), ''))
+})
+app.post('/campaigns/:id/resume', async (c) => {
+  const id = Number(c.req.param('id')), db = c.env.DB
+  const f: any = await c.req.parseBody()
+  const camp = await db.prepare('SELECT * FROM campaigns WHERE id=?').bind(id).first<any>()
+  if (!camp) return c.text('campaign not found', 404)
+  try {
+    if (!['paused', 'stopped'].includes(camp.status)) throw new Error('일시정지된 캠페인이 아닙니다')
+    await resumeCampaign(db, id, Number(f.daily_quota), Number(f.days))
+    return c.redirect('/', 303)
+  } catch (e: any) {
+    return c.html(page('캠페인 재개', resumeHtml(camp, e.message || String(e)), ''), 400)
+  }
+})
+
+// ── 작업큐 ──
+app.get('/queue', async (c) => {
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(c.req.query('day') || '') ? c.req.query('day')! : kstToday()
+  const rows = await c.env.DB.prepare(`SELECT j.*, c.name campaign_name, c.traffic_type FROM jobs j JOIN campaigns c ON c.id=j.campaign_id
+      WHERE j.schedule_date=? ORDER BY j.queue_seq ASC LIMIT 3000`).bind(day).all()
+  return c.html(page('작업큐', queueHtml(day, rows.results || []), '/queue'))
+})
+
+const NAV: [string, string][] = [['/', '대시보드'], ['/campaigns/new', '캠페인 생성'], ['/queue', '작업큐'], ['/devices', '기기관리'], ['/accounts', '카카오 계정']]
+
+const page = (title: string, body: string, path = '') => `<!doctype html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title} · Traffic CP</title><style>
-:root{--bg:#f3f1ec;--panel:#fffdf8;--ink:#1c1a17;--muted:#6b645c;--line:#ddd4c7;--accent:#0f6b5c;--ok:#1f6b3a;--danger:#9b2c2c;--warn:#9a4a16}
-*{box-sizing:border-box}body{margin:0;font-family:"Apple SD Gothic Neo",system-ui,sans-serif;color:var(--ink);background:var(--bg)}
-.wrap{max-width:1100px;margin:0 auto;padding:22px 18px 48px}.nav{display:flex;gap:16px;align-items:center;margin-bottom:24px;padding-bottom:12px;border-bottom:1px solid var(--line)}
-.nav a{color:var(--muted);font-weight:600;text-decoration:none}.nav a.brand{color:var(--ink);font-size:1.1rem}
-h1{font-size:1.5rem;margin:0 0 6px}.sub{color:var(--muted);margin:0 0 18px}
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.card .label{color:var(--muted);font-size:.8rem;font-weight:600}.card .value{font-size:1.7rem;font-weight:700;margin-top:4px}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
-table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
-th{color:var(--muted);font-size:.75rem;text-transform:uppercase}button{padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--accent);color:#fff;font-weight:600;cursor:pointer}
-input,textarea,select{padding:7px 9px;border:1px solid var(--line);border-radius:8px;font-family:inherit}
+<title>${esc(title)} · Campaign Queue</title><style>
+:root{--bg:#f3f1ec;--panel:#fffdf8;--ink:#1c1a17;--muted:#6b645c;--line:#ddd4c7;--accent:#0f6b5c;--accent-soft:#d7efe9;--ok:#1f6b3a;--danger:#9b2c2c;--warn:#9a4a16;--shadow:0 10px 30px rgba(40,30,20,.08);--radius:14px}
+*{box-sizing:border-box}body{margin:0;font-family:"Avenir Next","Segoe UI","Apple SD Gothic Neo",sans-serif;color:var(--ink);min-height:100vh;
+background:radial-gradient(ellipse at top left,#efe6d6 0%,transparent 45%),linear-gradient(180deg,#f7f4ee 0%,var(--bg) 100%)}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{max-width:1100px;margin:0 auto;padding:24px 20px 48px}.nav{display:flex;flex-wrap:wrap;gap:16px;align-items:center;margin-bottom:28px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.nav a{color:var(--muted);font-weight:600}.nav a.brand{color:var(--ink);font-weight:700;font-size:1.15rem;letter-spacing:-.02em}.nav a.active,.nav a:hover{color:var(--accent)}
+h1{font-size:1.7rem;margin:0 0 8px;letter-spacing:-.03em}.sub{color:var(--muted);margin:0 0 22px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}@media(max-width:800px){.grid{grid-template-columns:repeat(2,1fr)}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow)}
+.card .label{color:var(--muted);font-size:.82rem;font-weight:600}.card .value{font-size:1.8rem;font-weight:700;margin-top:4px;letter-spacing:-.03em}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow);margin-bottom:18px;overflow-x:auto}
+.panel h2{margin:0 0 12px;font-size:1.1rem}
+table{width:100%;border-collapse:collapse;font-size:.92rem}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.04em}
+button{padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--accent);color:#fff;font-weight:600;cursor:pointer}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:.78rem;font-weight:700;background:#eee7dc;color:var(--muted)}
+.badge.pending{background:#efe8d7;color:#7a6230}.badge.running,.badge.leased{background:#d9ebff;color:#13508a}
+.badge.success{background:#dff3e5;color:var(--ok)}.badge.failed{background:#f6dede;color:var(--danger)}
+.badge.active{background:var(--accent-soft);color:var(--accent)}.badge.paused{background:#fff0d6;color:#8a5a00}
+.badge.stopped{background:#ececec;color:#666}.badge.online{background:#dff3e5;color:var(--ok)}.badge.offline{background:#eee;color:#888}
+.btn{display:inline-block;border:none;cursor:pointer;border-radius:10px;padding:10px 14px;font-weight:700;font-size:.92rem;background:var(--accent);color:#fff}
+.btn.secondary{background:#ebe4d8;color:var(--ink)}.btn.danger{background:var(--danger);color:#fff}.btn:hover{filter:brightness(1.05);text-decoration:none}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:700px){.form-grid{grid-template-columns:1fr}}
+.field{display:flex;flex-direction:column;gap:6px}.field.full{grid-column:1/-1}label{font-weight:700;font-size:.86rem}
+input,select,textarea{border:1px solid var(--line);border-radius:10px;padding:10px 12px;font:inherit;background:#fff}
+.help{color:var(--muted);font-size:.85rem;line-height:1.45}
+.error{background:#fdeceb;color:var(--danger);border:1px solid #f0c0c0;padding:10px 12px;border-radius:10px;margin-bottom:14px}
+.ok{background:#e7f6ec;color:var(--ok);border:1px solid #b8dfc4;padding:10px 12px;border-radius:10px;margin-bottom:14px;font-weight:600}
+.traffic-cards{display:grid;gap:8px}.traffic-option{border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:grid;grid-template-columns:auto 1fr;gap:10px;align-items:start;background:#fff;cursor:pointer}
+.traffic-option:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}.traffic-option strong{display:block;margin-bottom:2px}
+.traffic-option .desc{color:var(--muted);font-size:.86rem;line-height:1.4;font-weight:400}
+.actions{display:flex;gap:10px;margin-top:16px}
+.queue-chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 10px;margin:3px;font-size:.82rem;background:#fff}
+tr.clickable-row{cursor:pointer}tr.clickable-row:hover td{background:#f3eee4}
+table.kv th{width:140px;color:var(--muted);font-size:.82rem;text-transform:none;letter-spacing:0;font-weight:700;padding:8px 8px 8px 0}
+table.kv td{border-bottom:1px solid var(--line);padding:8px 0}
+.alert{background:#fff0d6;border:1px solid #e6c98a;color:#8a5a00;padding:12px 14px;border-radius:10px;margin-bottom:16px;font-weight:600}
 .tag{display:inline-block;padding:1px 7px;border-radius:999px;font-size:.72rem;font-weight:700}
 .tag-ok{background:#d9efe2;color:var(--ok)}.tag-unknown{background:#ece7de;color:var(--muted)}
 .tag-verify_required{background:#f6e3cf;color:var(--warn)}.tag-bad{background:#f3d9d9;color:var(--danger)}
@@ -614,29 +823,211 @@ input,textarea,select{padding:7px 9px;border:1px solid var(--line);border-radius
 .noshot{display:flex;align-items:center;justify-content:center;color:#8d857a;font-size:.8rem}
 .bar{height:9px;background:#e6ded1;border-radius:99px;overflow:hidden}.bar>i{display:block;height:100%;background:var(--accent)}
 .bar>i.warn{background:var(--warn)}.bar>i.danger{background:var(--danger)}
-.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 8px;font-size:.82rem}.kv b{color:var(--muted);font-weight:600}
+div.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 8px;font-size:.82rem}div.kv b{color:var(--muted);font-weight:600}
 .btns{display:flex;flex-wrap:wrap;gap:5px}.btns button{padding:4px 8px;font-size:.76rem;background:#efe9de;color:var(--ink);border:1px solid var(--line)}
 .btns button.on{background:var(--accent);color:#fff}
 .modal{position:fixed;inset:0;background:#000c;display:none;align-items:center;justify-content:center;z-index:9}
 .modal.show{display:flex}.modal img{max-height:92vh;max-width:92vw;border-radius:8px}
 </style></head><body><div class="wrap">
-<nav class="nav"><a class="brand" href="/">Traffic CP</a><a href="/">대시보드</a><a href="/devices">기기관리</a><a href="/campaigns">캠페인</a><a href="/accounts">카카오 계정</a></nav>
+<nav class="nav"><a class="brand" href="/">Campaign Queue</a>${NAV.map(([h, t]) => `<a href="${h}"${h === path ? ' class="active"' : ''}>${t}</a>`).join('')}</nav>
 ${body}</div></body></html>`
 
-const dashHtml = () => `<h1>대시보드</h1><p class="sub">Cloudflare Workers + D1 컨트롤플레인</p>
-<div class="grid" id="stats"></div>
-<div class="panel"><h2 style="margin:0 0 10px">기기</h2><table><thead><tr><th>시리얼</th><th>워커</th><th>온라인</th><th>busy job</th><th>마지막 하트비트</th></tr></thead><tbody id="devs"></tbody></table></div>
-<script>
-async function j(u,o){const r=await fetch(u,o);return r.json()}
-async function load(){
- const s=await j('/api/accounts/kakao/stats')
- document.getElementById('stats').innerHTML=[['계정',s.total],['미투입',s.never_used],['오늘투입',s.used_today],['리스중',s.leased]]
-   .map(x=>'<div class="card"><div class="label">'+x[0]+'</div><div class="value">'+x[1]+'</div></div>').join('')
- const d=await j('/api/devices')
- document.getElementById('devs').innerHTML=d.map(x=>'<tr><td>'+x.serial+'</td><td>'+(x.worker_id||'')+'</td><td>'+(x.online?'🟢':'⚪')+'</td><td>'+(x.busy_job_id||'')+'</td><td class="muted">'+(x.last_heartbeat||'')+'</td></tr>').join('')||'<tr><td colspan=5 class=muted>연결된 기기 없음</td></tr>'
+// ── 옛 campaign_web 화면 (대시보드 / 캠페인 생성·상세·재개 / 작업큐) ──
+async function dashHtml(db: D1Database) {
+  await expirePastCampaigns(db)
+  const today = kstToday(), [ds, de] = kstDayUtcRange(today)
+  const n = async (sql: string, ...v: any[]) => (await db.prepare(sql).bind(...v).first<any>())?.n ?? 0
+  const pending = await n(`SELECT COUNT(*) n FROM jobs j JOIN campaigns c ON c.id=j.campaign_id
+      WHERE j.schedule_date=? AND j.status='pending' AND c.status='active'`, today)
+  const running = await n(`SELECT COUNT(*) n FROM jobs j JOIN campaigns c ON c.id=j.campaign_id
+      WHERE j.status IN ('leased','running') AND c.status='active'`)
+  const success = await n(`SELECT COUNT(*) n FROM jobs WHERE status='success' AND finished_at>=? AND finished_at<?`, ds, de)
+  const failed = await n(`SELECT COUNT(*) n FROM jobs WHERE status='failed' AND finished_at>=? AND finished_at<?`, ds, de)
+  const camps = (await db.prepare(`SELECT c.*,
+      (SELECT COUNT(*) FROM jobs j WHERE j.campaign_id=c.id AND j.schedule_date=? AND j.status!='paused') planned,
+      (SELECT COUNT(*) FROM jobs j WHERE j.campaign_id=c.id AND j.status='success' AND j.finished_at>=? AND j.finished_at<?) done,
+      (SELECT COUNT(*) FROM jobs j WHERE j.campaign_id=c.id AND j.status='failed' AND j.finished_at>=? AND j.finished_at<?) fail
+    FROM campaigns c ORDER BY c.id DESC`).bind(today, ds, de, ds, de).all()).results || []
+  const devs = (await db.prepare('SELECT * FROM devices ORDER BY serial').all()).results || []
+  const online = (d: any) => !!d.last_heartbeat && Date.now() - new Date(d.last_heartbeat + 'Z').getTime() <= 90000
+  const preview = (await db.prepare(`SELECT j.queue_seq, j.status, c.name FROM jobs j JOIN campaigns c ON c.id=j.campaign_id
+      WHERE j.schedule_date=? ORDER BY j.queue_seq ASC LIMIT 40`).bind(today).all()).results || []
+
+  const campRows = camps.map((c: any) => `<tr class="clickable-row" onclick="location.href='/campaigns/${c.id}'" title="설정 보기">
+    <td><strong><a href="/campaigns/${c.id}" onclick="event.stopPropagation()">${esc(c.name)}</a></strong></td>
+    <td>${esc(trafficLabel(c.traffic_type))}</td><td>${badge(c.status)}</td><td>${c.daily_quota}</td>
+    <td>${c.done}/${c.planned} <span class="muted">(fail ${c.fail})</span></td>
+    <td>${esc(c.start_date)} · ${c.days}일</td>
+    <td onclick="event.stopPropagation()">${c.status === 'active'
+      ? `<form method="post" action="/campaigns/${c.id}/pause" style="display:inline"><button class="btn danger" type="submit">중단</button></form>`
+      : ['paused', 'stopped'].includes(c.status) ? `<a class="btn secondary" href="/campaigns/${c.id}/resume">재개</a>` : ''}</td></tr>`).join('')
+
+  return `<h1>오늘 집행 현황</h1>
+<p class="sub">${today} · 오늘 진행률이 낮은 캠페인부터 고르게 배분됩니다. 캠페인 이름을 누르면 설정을 볼 수 있습니다.</p>
+${devs.some(online) ? '' : '<div class="alert">워커가 오프라인입니다. 윈도우 PC에서 <code>python fleet.py</code> 를 실행하세요. 캠페인 재개만으로는 폰 작업이 시작되지 않습니다.</div>'}
+<div class="grid">
+  <div class="card"><div class="label">대기(오늘)</div><div class="value">${pending}</div></div>
+  <div class="card"><div class="label">실행중</div><div class="value">${running}</div></div>
+  <div class="card"><div class="label">성공(오늘)</div><div class="value">${success}</div></div>
+  <div class="card"><div class="label">실패(오늘)</div><div class="value">${failed}</div></div>
+</div>
+<div class="panel"><h2>캠페인</h2>${camps.length ? `<table><thead><tr><th>이름</th><th>트래픽</th><th>상태</th><th>일유입량</th><th>오늘 진행</th><th>기간</th><th></th></tr></thead>
+<tbody>${campRows}</tbody></table>` : '<p class="muted">등록된 캠페인이 없습니다. <a href="/campaigns/new">캠페인을 만들어보세요</a>.</p>'}</div>
+<div class="panel"><h2>디바이스 (워커) <a href="/devices" style="font-size:.85rem;font-weight:600">기기관리</a></h2>${devs.length ? `<table>
+<thead><tr><th>Serial</th><th>Host</th><th>상태</th><th>Busy Job</th><th>Heartbeat</th></tr></thead><tbody>${devs.map((d: any) => `<tr>
+<td>${esc(d.label || d.serial)}${d.label ? ` <span class="muted">${esc(d.serial)}</span>` : ''}</td><td>${esc(d.host)}</td><td>${badge(online(d) ? 'online' : 'offline')}</td>
+<td>${d.busy_job_id ?? '-'}</td><td class="muted">${esc(d.last_heartbeat || '-')}</td></tr>`).join('')}</tbody></table>`
+    : '<p class="muted">아직 heartbeat 한 워커가 없습니다. <code>python fleet.py</code></p>'}</div>
+<div class="panel"><h2>오늘 큐 미리보기 <a href="/queue" style="font-size:.85rem;font-weight:600">전체 보기</a></h2>${preview.length
+    ? `<div>${preview.map((j: any) => `<span class="queue-chip"><strong>#${j.queue_seq}</strong> ${esc(j.name)} ${badge(j.status)}</span>`).join('')}</div>`
+    : '<p class="muted">오늘 큐가 비어 있습니다.</p>'}</div>`
 }
-load();setInterval(load,5000)
-</script>`
+
+function campaignFormHtml(error: string | null) {
+  const today = kstToday()
+  return `<h1>캠페인 생성</h1>
+<p class="sub">일유입량 × 일수만큼 작업이 생성되고, 다른 캠페인과 섞여 큐에 들어갑니다.</p>
+${error ? `<div class="error">${esc(error)}</div>` : ''}
+<form class="panel" method="post" action="/campaigns/new">
+  <div class="form-grid">
+    <div class="field"><label>캠페인 이름</label><input name="name" required placeholder="예: A_왕코등갈비" /></div>
+    <div class="field"><label>일유입량</label><input type="number" name="daily_quota" min="1" value="200" required />
+      <div class="help">하루에 실행할 작업 횟수. 200이면 매일 200회.</div></div>
+    <div class="field"><label>시작일자</label><input type="date" name="start_date" value="${today}" required /></div>
+    <div class="field"><label>일수</label><input type="number" name="days" min="1" value="5" required />
+      <div class="help">시작일부터 N일. 5일이면 시작일~시작일+4일.</div></div>
+    <div class="field full"><label>트래픽 종류</label><div class="traffic-cards">
+      ${TRAFFIC_TYPES.map((t, i) => `<label class="traffic-option"><input type="radio" name="traffic_type" value="${t.key}"${i === 0 ? ' checked' : ''} required />
+        <span><strong>${esc(t.label)}</strong><span class="desc">${esc(t.description)}</span></span></label>`).join('')}
+    </div></div>
+    <div class="field"><label>키워드</label><input name="keyword" placeholder="검색 키워드" /></div>
+    <div class="field"><label>장소 URL (클릭/체류/풀)</label><input name="place_url" placeholder="https://place.map.kakao.com/..." /></div>
+    <div class="field full"><label>업체명 / 2차 키워드</label><input name="place_name" placeholder="카카오맵 업체명 또는 함많찾을 2차 검색어" />
+      <div class="help">함많찾을에서는 2차 검색 키워드로 사용합니다.</div></div>
+    <div class="field" id="dwell-min-field"><label>체류 최소(초)</label><input type="number" name="dwell_min" min="1" step="1" value="15" /></div>
+    <div class="field" id="dwell-max-field"><label>체류 최대(초)</label><input type="number" name="dwell_max" min="1" step="1" value="20" />
+      <div class="help">카카오맵 일반트래픽·함많찾을에서 페이지 체류 시간 범위입니다.</div></div>
+  </div>
+  <div class="actions"><button class="btn" type="submit">생성하고 큐에 넣기</button><a class="btn secondary" href="/">취소</a></div>
+</form>
+<script>(function(){const radios=document.querySelectorAll('input[name="traffic_type"]');
+const minF=document.getElementById('dwell-min-field'),maxF=document.getElementById('dwell-max-field');
+function sync(){const v=document.querySelector('input[name="traffic_type"]:checked');const show=v&&${JSON.stringify(DWELL_TYPES)}.includes(v.value);
+minF.style.display=show?'':'none';maxF.style.display=show?'':'none'}
+radios.forEach(r=>r.addEventListener('change',sync));sync()})()</script>`
+}
+
+async function campaignDetailHtml(db: D1Database, id: number, flash: string | null, error: string | null) {
+  const c = await db.prepare('SELECT * FROM campaigns WHERE id=?').bind(id).first<any>()
+  if (!c) return null
+  const today = kstToday(), [ds, de] = kstDayUtcRange(today)
+  const n = async (sql: string, ...v: any[]) => (await db.prepare(sql).bind(...v).first<any>())?.n ?? 0
+  const done = await n(`SELECT COUNT(*) n FROM jobs WHERE campaign_id=? AND status='success' AND finished_at>=? AND finished_at<?`, id, ds, de)
+  const failed = await n(`SELECT COUNT(*) n FROM jobs WHERE campaign_id=? AND status='failed' AND finished_at>=? AND finished_at<?`, id, ds, de)
+  const pending = await n(`SELECT COUNT(*) n FROM jobs WHERE campaign_id=? AND schedule_date=? AND status='pending'`, id, today)
+  const planned = (await n(`SELECT COUNT(*) n FROM jobs WHERE campaign_id=? AND schedule_date=? AND status!='paused'`, id, today)) || c.daily_quota
+  const fails = (await db.prepare(`SELECT id, finished_at, error_message, device_serial FROM jobs WHERE campaign_id=? AND status='failed'
+      AND finished_at>=? AND finished_at<? ORDER BY finished_at DESC LIMIT 8`).bind(id, ds, de).all()).results || []
+  const params = JSON.parse(c.params_json || '{}')
+  const kw2 = params.keyword2 || c.place_name || ''
+  const isHam = c.traffic_type === 'hamman_find', showDwell = DWELL_TYPES.includes(c.traffic_type)
+  const editable = ['active', 'paused'].includes(c.status)
+  return `<h1>${esc(c.name)}</h1>
+<p class="sub">등록 시 세팅한 캠페인 설정입니다. <a href="/">← 대시보드</a></p>
+${flash ? `<div class="ok">${esc(flash)}</div>` : ''}${error ? `<div class="error">${esc(error)}</div>` : ''}
+<div class="panel"><h2>기본</h2><table class="kv">
+  <tr><th>상태</th><td>${badge(c.status)}</td></tr>
+  <tr><th>트래픽</th><td>${esc(trafficLabel(c.traffic_type))} <span class="muted">(${esc(c.traffic_type)})</span></td></tr>
+  <tr><th>일유입량</th><td>${c.daily_quota}회/일</td></tr>
+  <tr><th>기간</th><td>${esc(c.start_date)} ~ ${campaignEnd(c)} (${c.days}일)</td></tr>
+  <tr><th>생성시각</th><td class="muted">${esc(c.created_at)}</td></tr>
+</table></div>
+${editable ? `<form class="panel" method="post" action="/campaigns/${id}/settings">
+  <h2>유입·일수 수정</h2>
+  <p class="help" style="margin:0 0 12px">저장하면 남은 대기 작업 큐가 바로 다시 맞춰집니다. (실행 중·완료 job은 유지)
+    <strong style="display:block;margin-top:6px;color:var(--ok)">즉시 반영됩니다.</strong></p>
+  <div class="form-grid">
+    <div class="field"><label>일유입량</label><input type="number" name="daily_quota" min="1" value="${c.daily_quota}" required />
+      <div class="help">하루에 실행할 작업 횟수.</div></div>
+    <div class="field"><label>진행 일수</label><input type="number" name="days" min="1" max="365" value="${c.days}" required />
+      <div class="help">시작일(${esc(c.start_date)})부터 N일. 종료일 = 시작일+N−1.
+      ${c.status === 'paused' ? '일시정지 상태에서는 설정만 바뀌고, 재개 시 반영됩니다.' : ''}</div></div>
+  </div>
+  <div class="actions"><button class="btn" type="submit">저장 (즉시 반영)</button></div>
+</form>
+<form class="panel" method="post" action="/campaigns/${id}/settings">
+  <h2>키워드·체류 수정</h2>
+  <p class="help" style="margin:0 0 12px">저장하면 DB에 바로 반영되고, <strong>다음에 claim 되는 job부터</strong> 새 키워드로 실행됩니다.
+    (대기 큐 재구축 불필요 · 이미 실행 중인 job은 기존 값 유지)
+    <strong style="display:block;margin-top:6px;color:var(--ok)">즉시 반영됩니다.</strong></p>
+  <div class="form-grid">
+    <div class="field"><label>키워드</label><input name="keyword" value="${esc(c.keyword)}" placeholder="검색 키워드" />
+      <div class="help">1차 검색어. 함많찾을·다음·카카오 공통.</div></div>
+    <div class="field"><label>${isHam ? '2차 키워드' : '업체명 / 2차 키워드'}</label>
+      <input name="keyword2" value="${esc(kw2)}" placeholder="예: 수유소고기 청가숯불구이" />
+      <div class="help">${isHam ? '함많찾을 2차 검색어 (<code>--keyword2</code>). place_name 과 함께 저장됩니다.' : '카카오맵 업체명 등. 함많찾을이면 2차 검색어로도 씁니다.'}</div></div>
+    <div class="field full"><label>장소 URL</label><input name="place_url" value="${esc(c.place_url)}" placeholder="https://place.map.kakao.com/..." /></div>
+    ${showDwell ? `<div class="field"><label>체류 최소(초)</label><input type="number" name="dwell_min" min="1" step="1" value="${esc(params.dwell_min ?? 15)}" /></div>
+    <div class="field"><label>체류 최대(초)</label><input type="number" name="dwell_max" min="1" step="1" value="${esc(params.dwell_max ?? 20)}" />
+      <div class="help">카카오맵 일반트래픽·함많찾을 체류 시간 범위.</div></div>` : ''}
+  </div>
+  <div class="actions"><button class="btn" type="submit">저장 (즉시 반영)</button></div>
+</form>` : ''}
+<div class="panel"><h2>검색·장소</h2><table class="kv">
+  <tr><th>키워드</th><td>${esc(c.keyword || '—')}</td></tr>
+  <tr><th>${isHam ? '2차 키워드' : '업체명'}</th><td>${esc(kw2 || '—')}</td></tr>
+  <tr><th>장소 URL</th><td>${c.place_url ? `<a href="${esc(c.place_url)}" target="_blank" rel="noopener">${esc(c.place_url)}</a>` : '—'}</td></tr>
+</table></div>
+<div class="panel"><h2>추가 파라미터</h2>${Object.keys(params).length
+    ? `<table class="kv">${Object.entries(params).map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(typeof v === 'object' ? JSON.stringify(v) : v)}</td></tr>`).join('')}</table>`
+    : '<p class="muted">추가 파라미터 없음</p>'}</div>
+<div class="panel"><h2>오늘 진행</h2>
+  <p>${done} / ${planned} 성공 <span class="muted">(실패 ${failed}, 대기 ${pending})</span></p>
+  ${fails.length ? `<h3 style="font-size:.95rem;margin:14px 0 8px">최근 실패</h3><table><thead><tr><th>Job</th><th>시각</th><th>기기</th><th>원인</th></tr></thead><tbody>
+  ${fails.map((j: any) => `<tr><td>#${j.id}</td><td class="muted">${esc(j.finished_at)}</td><td class="muted">${esc(j.device_serial || '-')}</td><td>${esc(j.error_message || '—')}</td></tr>`).join('')}</tbody></table>` : ''}
+  <div class="actions" style="margin-top:12px">
+    ${c.status === 'active' ? `<form method="post" action="/campaigns/${id}/pause" style="display:inline"><button class="btn danger" type="submit">중단</button></form>`
+      : ['paused', 'stopped'].includes(c.status) ? `<a class="btn secondary" href="/campaigns/${id}/resume">재개</a>` : ''}
+    <a class="btn secondary" href="/">대시보드</a>
+  </div>
+</div>`
+}
+
+function resumeHtml(c: any, error: string | null) {
+  const today = kstToday()
+  return `<h1>캠페인 재개</h1>
+<p class="sub"><strong>${esc(c.name)}</strong> 을(를) 다시 돌리려면 일유입량과 진행 일수를 다시 입력하세요.
+  시작일은 오늘(${today})로 잡히고, 종료일은 오늘부터 N일입니다.</p>
+${error ? `<div class="error">${esc(error)}</div>` : ''}
+<div class="panel" style="margin-bottom:16px"><table class="kv">
+  <tr><th>이전 일유입량</th><td>${c.daily_quota}회/일</td></tr>
+  <tr><th>이전 기간</th><td>${esc(c.start_date)} ~ ${campaignEnd(c)} (${c.days}일)</td></tr>
+  <tr><th>상태</th><td>${badge(c.status)}</td></tr>
+</table></div>
+<form class="panel" method="post" action="/campaigns/${c.id}/resume">
+  <div class="form-grid">
+    <div class="field"><label>일유입량</label><input type="number" name="daily_quota" min="1" value="${c.daily_quota}" required />
+      <div class="help">하루에 실행할 작업 횟수. 생성 시와 동일합니다.</div></div>
+    <div class="field"><label>진행 일수</label><input type="number" name="days" min="1" max="365" value="${c.days}" required />
+      <div class="help">오늘부터 N일. 5일이면 오늘~오늘+4일.</div></div>
+  </div>
+  <div class="actions"><button class="btn" type="submit">재개하고 큐에 넣기</button><a class="btn secondary" href="/">취소</a></div>
+</form>`
+}
+
+function queueHtml(day: string, jobs: any[]) {
+  return `<h1>작업큐</h1>
+<p class="sub">날짜별 작업 목록. 워커는 오늘 진행률이 가장 낮은 캠페인의 job 부터 가져갑니다.</p>
+<form class="panel" method="get" action="/queue" style="display:flex;gap:10px;align-items:end">
+  <div class="field" style="margin:0"><label>일자</label><input type="date" name="day" value="${day}" /></div>
+  <button class="btn" type="submit">보기</button>
+</form>
+<div class="panel"><h2>${day} · ${jobs.length} jobs</h2>${jobs.length ? `<table>
+<thead><tr><th>Seq</th><th>캠페인</th><th>트래픽</th><th>예정시각</th><th>상태</th><th>기기</th></tr></thead><tbody>
+${jobs.map((j) => `<tr><td>${j.queue_seq}</td><td>${esc(j.campaign_name)}</td><td>${esc(trafficLabel(j.traffic_type))}</td>
+<td class="muted">${esc(j.scheduled_at || '-')}</td><td>${badge(j.status)}</td><td class="muted">${esc(j.device_serial || '-')}</td></tr>`).join('')}
+</tbody></table>` : '<p class="muted">이 날짜의 job이 없습니다.</p>'}</div>`
+}
 
 const accountsHtml = () => `<h1>카카오 계정</h1><p class="sub">할당은 <b>투입 오래된 순</b> — 표 위에서부터 나갑니다.</p>
 <div class="grid" id="stats"></div>
@@ -659,17 +1050,6 @@ async function load(){
 async function paste(){document.getElementById('tmsg').textContent='저장중…'
  const r=await j('/api/accounts/kakao/tokens/paste',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:document.getElementById('tok').value})})
  document.getElementById('tmsg').textContent='매칭 '+r.matched+' · 토큰 '+r.tokens_saved+(r.unmatched.length?' · 미매칭 '+r.unmatched.length:'');setTimeout(load,800)}
-load()
-</script>`
-
-const campaignsHtml = () => `<h1>캠페인</h1><p class="sub">설정된 캠페인. 활성화하면 오늘부터 일수×일유입량만큼 큐 생성.</p>
-<div class="panel"><table><thead><tr><th>#</th><th>이름</th><th>트래픽</th><th>키워드</th><th>장소</th><th>일유입/일수</th><th>상태</th><th></th></tr></thead><tbody id="rows"></tbody></table></div>
-<script>
-async function j(u,o){const r=await fetch(u,o);return r.json()}
-async function load(){const a=await j('/api/campaigns')
- document.getElementById('rows').innerHTML=a.map(c=>'<tr><td class=muted>'+c.id+'</td><td>'+c.name+'</td><td>'+c.traffic_type+'</td><td>'+(c.keyword||'')+'</td><td>'+(c.place_name||'')+'</td><td>'+c.daily_quota+' / '+c.days+'</td><td><span class="tag '+(c.status==='active'?'tag-ok':'tag-unknown')+'">'+c.status+'</span></td><td>'+(c.status==='active'?'<button onclick="pause('+c.id+')">일시정지</button>':'<button onclick="act('+c.id+')">활성화</button>')+'</td></tr>').join('')}
-async function act(id){if(!confirm('활성화하면 오늘부터 큐가 생성됩니다. 계속?'))return;await j('/api/campaigns/'+id+'/activate',{method:'POST'});load()}
-async function pause(id){await j('/api/campaigns/'+id+'/pause',{method:'POST'});load()}
 load()
 </script>`
 
