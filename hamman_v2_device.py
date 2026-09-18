@@ -691,14 +691,14 @@ def bring_into_view(ch: Chrome, tgt: dict) -> Optional[dict]:
         if not loc:
             return None
         h = loc["h"]
-        want_lo, want_hi = h * 0.28, h * 0.68
+        want_lo, want_hi = h * 0.38, h * 0.70   # 상단 고정 막대(약 20%) 아래
         mid = (loc["top"] + loc["bottom"]) / 2
         if want_lo <= mid <= want_hi:
             return loc
         vp = ch.viewport()
         room_up = vp.get("y", 0)
         room_down = max(0, vp.get("dh", 0) - vp.get("y", 0) - h)
-        delta = mid - h * random.uniform(0.38, 0.55)
+        delta = mid - h * random.uniform(0.45, 0.6)
         # 페이지 끝(위/아래)이라 더 못 움직이면, 화면 안에 충분히 보일 때 그 자리에서 누른다
         if (delta < 0 and room_up < 24) or (delta > 0 and room_down < 24):
             if loc["top"] >= h * 0.12 and loc["bottom"] <= h * 0.9:
@@ -754,11 +754,21 @@ def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
             log("    ... 목표를 화면에 맞추지 못함 → 다른 글")
             continue
         time.sleep(random.uniform(0.5, 1.3))          # 제목 읽는 시간
-        x = loc["tl"] + (loc["tr"] - loc["tl"]) * random.uniform(0.2, 0.7)
-        y = loc["tt"] + (loc["tb"] - loc["tt"]) * random.uniform(0.35, 0.65)
-        hit = ch.cdp.eval(JS_HIT % (x, y, json.dumps(tgt["href"])))
+        hit, x, y = "none", 0.0, 0.0
+        for fix in range(3):
+            # 위로 스크롤하면 네이버 상단 검색·탭 막대가 다시 내려와 제목을 덮는다 → 매번 새로 측정
+            loc = ch.cdp.eval(JS_LOCATE % (json.dumps(tgt["href"]), json.dumps(tgt["txt"]))) or loc
+            x = loc["tl"] + (loc["tr"] - loc["tl"]) * random.uniform(0.2, 0.7)
+            y = loc["tt"] + (loc["tb"] - loc["tt"]) * random.uniform(0.35, 0.65)
+            hit = ch.cdp.eval(JS_HIT % (x, y, json.dumps(tgt["href"])))
+            if hit == "ok":
+                break
+            log(f"    ... 좌표 가림({hit[:50]}) → 살짝 내려 상단 막대 숨기고 재측정 {fix + 1}/2")
+            if fix < 2:
+                ch.scroll(random.uniform(90, 160))     # 아래로 스크롤 = 상단 고정 막대 숨김
+                time.sleep(random.uniform(0.5, 0.8))
         if hit != "ok":
-            log(f"    ... 좌표 검증 실패({hit}) → 재시도")
+            log(f"    ... 좌표 검증 실패({hit}) → 다른 글")
             continue
         tr.shot(f"{label}_before_tap")
         ch.phase(f"{label}_page")
