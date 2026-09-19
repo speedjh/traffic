@@ -743,8 +743,29 @@ def return_to(ch: Chrome, url: str) -> bool:
     return ok
 
 
+def wait_serp_content(ch: Chrome, timeout: float = 30.0) -> bool:
+    """검색결과 본문이 실제로 그려질 때까지 대기. 느린 회선에서 빈 화면을 '페이지 끝·글 없음'으로
+    오판하지 않도록 링크 수와 문서 높이로 판단한다."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            st = ch.cdp.eval("({n: document.querySelectorAll('a[href]').length,"
+                             " dh: document.documentElement.scrollHeight, h: innerHeight})", timeout=5) or {}
+            if st.get("n", 0) >= 40 and st.get("dh", 0) >= st.get("h", 700) * 3:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.6)
+    return False
+
+
 def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
     """검색결과에서 허용 글 1개를 정확히 눌러 진입. 금지 목적지는 애초에 누르지 않는다."""
+    t0 = time.time()
+    if not wait_serp_content(ch, 30):
+        log(f"    ... 검색결과 본문 로딩 지연(30초) — 그대로 진행")
+    elif time.time() - t0 > 5:
+        log(f"    ... 검색결과 본문 로딩 대기 {time.time() - t0:.0f}초")
     serp_url = ch.url()
     tried: set = set()
     for attempt in range(4):
