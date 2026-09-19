@@ -219,6 +219,22 @@ class Chrome:
         self.cdp.send("Network.enable", {})
         self.cdp.send("Page.enable", {})
 
+    def reconnect(self) -> bool:
+        """DevTools 연결이 멈췄을 때 같은 탭(없으면 첫 탭)에 다시 붙는다. 바이트 집계는 유지."""
+        keep = (self.bytes, dict(self.phase_bytes), set(self.origins), getattr(self, "_phase", None))
+        pages = self.pages()
+        if not pages:
+            return False
+        t = next((p for p in pages if p["id"] == self.target_id), pages[0])
+        try:
+            self.attach(t)
+        except Exception as e:
+            log(f"    ... DevTools 재연결 실패: {e}")
+            return False
+        self.bytes, self.phase_bytes, self.origins, self._phase = keep
+        log("    ... DevTools 재연결됨")
+        return True
+
     def _on_finished(self, p: dict) -> None:
         self.bytes += int(p.get("encodedDataLength") or 0)
 
@@ -831,13 +847,34 @@ def dwell(ch: Chrome, d: u2.Device, lo: float, hi: float, max_scrolls: int) -> N
 
 
 def back_to_serp(ch: Chrome, d: u2.Device, keyword: str) -> bool:
-    for _ in range(3):
+    """검색결과로 복귀. 네이버 블로그는 페이지 안에서 방문기록을 쌓아(pushState) 뒤로가기 몇 번으로는
+    못 빠져나오므로, 크롬 방문기록에서 해당 검색결과 항목을 찾아 곧바로 그 항목으로 돌아간다."""
+    is_serp = lambda u: "search.naver.com" in u and same_query(query_of(u), keyword)  # noqa: E731
+    for attempt in range(2):
+        try:
+            h = ch.cdp.send("Page.getNavigationHistory", {}, timeout=10)
+            idx, entries = h.get("currentIndex", 0), h.get("entries", [])
+            back = [e for i, e in enumerate(entries) if i < idx and is_serp(e.get("url", ""))]
+            if back:
+                steps = idx - entries.index(back[-1])
+                ch.cdp.send("Page.navigateToHistoryEntry", {"entryId": back[-1]["id"]}, timeout=10)
+                if ch.wait_url(is_serp, 10):
+                    if steps > 1:
+                        log(f"    ... 방문기록으로 검색결과 복귀 (뒤로 {steps}단계 분량)")
+                    ch.wait_ready(10)
+                    return True
+            break
+        except Exception as e:
+            log(f"    ... 방문기록 복귀 실패({e}) → DevTools 재연결")
+            if attempt == 0 and not ch.reconnect():
+                break
+    # 폴백: 실제 뒤로 키
+    for _ in range(4):
         d.press("back")
-        cur = ch.wait_url(lambda u: "search.naver.com" in u, 8)
-        if cur:
-            if same_query(query_of(cur), keyword):
-                ch.wait_ready(10)
-                return True
+        cur = ch.wait_url(lambda u: "search.naver.com" in u, 6)
+        if cur and same_query(query_of(cur), keyword):
+            ch.wait_ready(10)
+            return True
     return False
 
 
@@ -880,7 +917,12 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
         ch.phase("back1")
         if not back_to_serp(ch, d, args.keyword):
             log("[!] 1차 검색결과로 복귀 실패 → 메인에서 2차 검색")
-            ch.cdp.send("Page.navigate", {"url": NAVER_HOME_URL, "transitionType": "typed"})
+            try:
+                ch.cdp.send("Page.navigate", {"url": NAVER_HOME_URL, "transitionType": "typed"})
+            except Exception:
+                if not ch.reconnect():
+                    raise
+                ch.cdp.send("Page.navigate", {"url": NAVER_HOME_URL, "transitionType": "typed"})
             ch.wait_url(lambda u: "m.naver.com" in u, 15)
             ch.wait_ready(15)
             search_from_home(ch, d, args.keyword2, tr)
