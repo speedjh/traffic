@@ -728,6 +728,20 @@ def bring_into_view(ch: Chrome, tgt: dict) -> Optional[dict]:
     return None
 
 
+def return_to(ch: Chrome, url: str) -> bool:
+    """뒤로 키 대신 저장한 검색결과 주소로 이동 (방문기록 끝에서 뒤로 키를 누르면 크롬이 닫힌다)."""
+    try:
+        ch.cdp.send("Page.navigate", {"url": url, "transitionType": "link"}, timeout=15)
+    except Exception:
+        if not ch.reconnect():
+            return False
+        ch.cdp.send("Page.navigate", {"url": url, "transitionType": "link"}, timeout=15)
+    ok = bool(ch.wait_url(lambda u: "search.naver.com" in u, 20))
+    if ok:
+        ch.wait_ready(15)
+    return ok
+
+
 def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
     """검색결과에서 허용 글 1개를 정확히 눌러 진입. 금지 목적지는 애초에 누르지 않는다."""
     serp_url = ch.url()
@@ -740,8 +754,7 @@ def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
                 log(f"[+] 페이지 진입(지연 확인): {cur[:90]}")
                 ch.wait_ready(15)
                 return True
-            d.press("back")
-            if not ch.wait_url(lambda u: "search.naver.com" in u, 8):
+            if not return_to(ch, serp_url):
                 log(f"[!] {label}: 검색결과로 복귀 실패")
                 return False
         tgt = None
@@ -820,8 +833,7 @@ def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
         if kind == "bad":
             # 이론상 발생하지 않아야 함 — 발생하면 즉시 뒤로
             log(f"[!] 예상 밖 목적지({cur[:60]}) → 뒤로")
-            d.press("back")
-            ch.wait_url(lambda u: "search.naver.com" in u, 8)
+            return_to(ch, serp_url)
             continue
         log(f"[+] 페이지 진입: {cur[:90]}")
         ch.wait_ready(15)
@@ -856,35 +868,42 @@ def dwell(ch: Chrome, d: u2.Device, lo: float, hi: float, max_scrolls: int) -> N
     log("[+] 체류 완료")
 
 
-def back_to_serp(ch: Chrome, d: u2.Device, keyword: str) -> bool:
+def back_to_serp(ch: Chrome, d: u2.Device, keyword: str, serp_url: str = "") -> bool:
     """검색결과로 복귀. 네이버 블로그는 페이지 안에서 방문기록을 쌓아(pushState) 뒤로가기 몇 번으로는
-    못 빠져나오므로, 크롬 방문기록에서 해당 검색결과 항목을 찾아 곧바로 그 항목으로 돌아간다."""
+    못 빠져나오므로, 크롬 방문기록에서 해당 검색결과 항목을 찾아 곧바로 그 항목으로 돌아간다.
+    실제 뒤로 키는 쓰지 않는다 — 방문기록 끝까지 가면 크롬이 닫혀 홈 화면으로 나가 버린다."""
     is_serp = lambda u: "search.naver.com" in u and same_query(query_of(u), keyword)  # noqa: E731
     for attempt in range(2):
         try:
             h = ch.cdp.send("Page.getNavigationHistory", {}, timeout=10)
             idx, entries = h.get("currentIndex", 0), h.get("entries", [])
             back = [e for i, e in enumerate(entries) if i < idx and is_serp(e.get("url", ""))]
-            if back:
-                steps = idx - entries.index(back[-1])
-                ch.cdp.send("Page.navigateToHistoryEntry", {"entryId": back[-1]["id"]}, timeout=10)
-                if ch.wait_url(is_serp, 10):
-                    if steps > 1:
-                        log(f"    ... 방문기록으로 검색결과 복귀 (뒤로 {steps}단계 분량)")
-                    ch.wait_ready(10)
-                    return True
+            if not back:
+                log(f"    ... 방문기록에 검색결과 없음 (항목 {len(entries)}개, 현재 {idx})")
+                break
+            steps = idx - entries.index(back[-1])
+            ch.cdp.send("Page.navigateToHistoryEntry", {"entryId": back[-1]["id"]}, timeout=10)
+            if ch.wait_url(is_serp, 20):          # 느린 기기·캐시 없음이면 검색결과 재로딩에 시간이 걸린다
+                if steps > 1:
+                    log(f"    ... 방문기록으로 검색결과 복귀 (뒤로 {steps}단계 분량)")
+                ch.wait_ready(15)
+                return True
+            log(f"    ... 방문기록 이동 후 검색결과 미도착 (현재 {ch.url()[:60]})")
             break
         except Exception as e:
             log(f"    ... 방문기록 복귀 실패({e}) → DevTools 재연결")
             if attempt == 0 and not ch.reconnect():
                 break
-    # 폴백: 실제 뒤로 키
-    for _ in range(4):
-        d.press("back")
-        cur = ch.wait_url(lambda u: "search.naver.com" in u, 6)
-        if cur and same_query(query_of(cur), keyword):
-            ch.wait_ready(10)
-            return True
+    # 폴백: 저장해 둔 검색결과 주소로 직접 이동 (크롬 밖으로 나갈 위험 없음)
+    if serp_url:
+        try:
+            ch.cdp.send("Page.navigate", {"url": serp_url, "transitionType": "link"}, timeout=15)
+            if ch.wait_url(is_serp, 20):
+                log("    ... 검색결과 주소로 직접 복귀")
+                ch.wait_ready(15)
+                return True
+        except Exception as e:
+            log(f"    ... 검색결과 주소 복귀 실패: {e}")
     return False
 
 
@@ -918,6 +937,7 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
         search_from_home(ch, d, args.keyword, tr)
         time.sleep(random.uniform(1.0, 2.0))
         tr.shot("serp1")
+        serp1_url = ch.url()
         if not open_article(ch, d, "1차", tr):
             return False, True, ch
         tr.shot("page1")
@@ -925,7 +945,7 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
 
         # 2차 — 뒤로 가서 검색결과 상단 검색창으로
         ch.phase("back1")
-        if not back_to_serp(ch, d, args.keyword):
+        if not back_to_serp(ch, d, args.keyword, serp1_url):
             log("[!] 1차 검색결과로 복귀 실패 → 메인에서 2차 검색")
             try:
                 ch.cdp.send("Page.navigate", {"url": NAVER_HOME_URL, "transitionType": "typed"})
