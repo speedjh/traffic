@@ -550,7 +550,8 @@ def search_from_home(ch: Chrome, d: u2.Device, keyword: str, tr: Tracer) -> None
             break
         log(f"    ... 검색 레이어 미전환(focus={focused_id(ch) or '-'}) → 키보드 닫고 재시도 {attempt + 1}/3")
         tr.shot(f"main_retry{attempt + 1}")
-        d.press("back")          # 키보드 닫기 (페이지 이동 아님)
+        # 키보드 닫기 — 뒤로 키는 방문기록이 짧으면 크롬을 닫을 수 있어 포커스 해제로 대신
+        ch.cdp.eval("(() => { const e = document.activeElement; if (e && e.blur) e.blur(); })()")
         time.sleep(random.uniform(1.5, 2.5))
         if "m.naver.com" not in ch.url():
             ch.cdp.send("Page.navigate", {"url": NAVER_HOME_URL, "transitionType": "typed"})
