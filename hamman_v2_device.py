@@ -789,13 +789,23 @@ def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
         tr.shot(f"{label}_before_tap")
         ch.phase(f"{label}_page")
         ch.tap(x, y)
-        cur = ch.wait_url(lambda u: u != serp_url and "search.naver.com" not in u, 12)
+        left_serp = lambda u: u != serp_url and "search.naver.com" not in u  # noqa: E731
+        cur = ch.wait_url(left_serp, 8)
         if not cur:
-            # 느린 기기: 탭은 먹혔지만 전환이 늦는 경우 — 조금 더 기다린 뒤 다시 확인
+            # 이동이 시작조차 안 됐으면(여전히 검색결과·로딩 완료) 탭이 씹힌 것 → 같은 글을 한 번 더
+            try:
+                idle = ch.cdp.eval("document.readyState", timeout=4) == "complete" and "search.naver.com" in ch.url()
+            except Exception:
+                idle = False
+            if idle and ch.cdp.eval(JS_HIT % (x, y, json.dumps(tgt["href"]))) == "ok":
+                log("    ... 탭 무반응 → 같은 글 다시 탭")
+                time.sleep(random.uniform(0.4, 0.9))
+                ch.tap(x + random.uniform(-6, 6), y + random.uniform(-3, 3))
+            # 느린 기기: 탭은 먹혔지만 전환이 늦는 경우도 여기서 기다린다
             # (여기서 다른 글을 고르면 이미 열린 글 안의 링크를 또 누르게 된다)
-            cur = ch.wait_url(lambda u: u != serp_url and "search.naver.com" not in u, 10)
+            cur = ch.wait_url(left_serp, 12)
             if cur:
-                log("    ... 전환 지연(느린 로딩) — 진입 확인")
+                log("    ... 전환 확인(지연/재탭)")
         if not cur:
             # 새 탭으로 열린 경우
             for t in ch.pages():
