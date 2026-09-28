@@ -768,7 +768,8 @@ def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
         log(f"    ... 검색결과 본문 로딩 대기 {time.time() - t0:.0f}초")
     serp_url = ch.url()
     tried: set = set()
-    for attempt in range(4):
+    reloaded = False
+    for attempt in range(5):
         # 재시도 전에 검색결과 페이지에 있는지 확인 (다른 페이지에서 링크를 고르지 않도록)
         if attempt and "search.naver.com" not in ch.url():
             cur = ch.url()
@@ -793,6 +794,19 @@ def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
             time.sleep(0.6)
         if not tgt:
             vp = ch.viewport()
+            # 본문이 끝까지 안 그려진 경우(문서만 받고 멈춤) — 한 번 새로고침하면 대개 살아난다
+            unrendered = (st.get("links", 0) < 40) or (vp.get("dh", 0) < vp.get("h", 700) * 2)
+            if unrendered and not reloaded:
+                reloaded = True
+                log(f"    ... 검색결과가 그려지지 않음 (링크 {st.get('links')}, 높이 {vp.get('dh')}) → 새로고침 1회")
+                try:
+                    ch.cdp.send("Page.reload", {}, timeout=15)
+                except Exception:
+                    if ch.reconnect():
+                        ch.cdp.send("Page.reload", {}, timeout=15)
+                ch.wait_ready(20)
+                wait_serp_content(ch, 25)
+                continue
             log(f"[!] {label}: 누를 수 있는 글이 없음 (링크 {st.get('links')}, 광고 {st.get('ad')}, "
                 f"금지 {st.get('bad')}, 비제목 {st.get('short')}, 후보 {st.get('ok')}, "
                 f"scrollY {int(vp.get('y', 0))}/{vp.get('dh')}, url {ch.url()[:60]})")
