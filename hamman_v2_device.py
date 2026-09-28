@@ -751,7 +751,9 @@ def wait_serp_content(ch: Chrome, timeout: float = 30.0) -> bool:
         try:
             st = ch.cdp.eval("({n: document.querySelectorAll('a[href]').length,"
                              " dh: document.documentElement.scrollHeight, h: innerHeight})", timeout=5) or {}
-            if st.get("n", 0) >= 40 and st.get("dh", 0) >= st.get("h", 700) * 3:
+            # 정상 검색결과는 링크 270~370개. 광고·플레이스 구간만 그려진 상태(60~80개)를
+            # '완료'로 보면 글이 하나도 없는 채로 포기하게 된다.
+            if st.get("n", 0) >= 120 and st.get("dh", 0) >= st.get("h", 700) * 4:
                 return True
         except Exception:
             pass
@@ -794,9 +796,9 @@ def open_article(ch: Chrome, d: u2.Device, label: str, tr: Tracer) -> bool:
             time.sleep(0.6)
         if not tgt:
             vp = ch.viewport()
-            # 본문이 끝까지 안 그려진 경우(문서만 받고 멈춤) — 한 번 새로고침하면 대개 살아난다
-            unrendered = (st.get("links", 0) < 40) or (vp.get("dh", 0) < vp.get("h", 700) * 2)
-            if unrendered and not reloaded:
+            # 글 후보가 하나도 없으면 본문이 덜 그려진 것으로 보고 한 번 새로고침한다(약 1MB).
+            # 광고·플레이스까지만 붙고 멈추는 경우가 있어 링크 수만으로는 판단하지 않는다.
+            if not reloaded:
                 reloaded = True
                 log(f"    ... 검색결과가 그려지지 않음 (링크 {st.get('links')}, 높이 {vp.get('dh')}) → 새로고침 1회")
                 try:
