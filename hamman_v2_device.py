@@ -219,6 +219,36 @@ class Chrome:
         self.cdp.send("Network.enable", {})
         self.cdp.send("Page.enable", {})
 
+    def open_in_new_tab(self, url: str) -> bool:
+        """멈춘 탭을 버리고 새 탭에서 연다. 렌더러가 굳으면 그 탭의 CDP 명령은 전부 응답하지 않는데,
+        탭 생성·종료는 HTTP 엔드포인트라 그 상황에서도 동작한다."""
+        keep = (self.bytes, dict(self.phase_bytes), set(self.origins), getattr(self, "_phase", None))
+        old = self.target_id
+        nt = None
+        for method in ("PUT", "GET"):
+            try:
+                nt = self._http(f"/json/new?{url}", method=method)
+                if isinstance(nt, dict) and nt.get("id"):
+                    break
+                nt = None
+            except Exception:
+                nt = None
+        if not nt:
+            log("    ... 새 탭 생성 실패")
+            return False
+        try:
+            self.attach(nt)
+        except Exception as e:
+            log(f"    ... 새 탭 연결 실패: {e}")
+            return False
+        self.bytes, self.phase_bytes, self.origins, self._phase = keep
+        try:
+            self._http(f"/json/close/{old}")
+        except Exception:
+            pass
+        log("    ... 멈춘 탭을 닫고 새 탭에서 검색결과 열기")
+        return True
+
     def reconnect(self) -> bool:
         """DevTools 연결이 멈췄을 때 같은 탭(없으면 첫 탭)에 다시 붙는다. 바이트 집계는 유지."""
         keep = (self.bytes, dict(self.phase_bytes), set(self.origins), getattr(self, "_phase", None))
@@ -942,12 +972,24 @@ def back_to_serp(ch: Chrome, d: u2.Device, keyword: str, serp_url: str = "") -> 
                 return True
         except Exception as e:
             log(f"    ... 검색결과 주소 복귀 실패: {e}")
+        # 탭이 굳은 경우 — 새 탭에서 검색결과를 연다
+        if ch.open_in_new_tab(serp_url) and ch.wait_url(is_serp, 20):
+            ch.wait_ready(15)
+            return True
     return False
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # 1회 실행
 # ══════════════════════════════════════════════════════════════════════════
+def _try(ch: Chrome, url: str) -> bool:
+    try:
+        ch.cdp.send("Page.navigate", {"url": url, "transitionType": "typed"}, timeout=15)
+        return True
+    except Exception:
+        return False
+
+
 def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
     log("[*] 로테이션 시작 전 데이터·IP 확인")
     if not ds.ensure_network(args.serial, timeout=args.recover_secs):
@@ -988,9 +1030,10 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
             try:
                 ch.cdp.send("Page.navigate", {"url": NAVER_HOME_URL, "transitionType": "typed"})
             except Exception:
-                if not ch.reconnect():
-                    raise
-                ch.cdp.send("Page.navigate", {"url": NAVER_HOME_URL, "transitionType": "typed"})
+                # 탭이 굳었으면 재연결도 소용없다 → 새 탭에서 연다
+                if not (ch.reconnect() and _try(ch, NAVER_HOME_URL)):
+                    if not ch.open_in_new_tab(NAVER_HOME_URL):
+                        raise
             ch.wait_url(lambda u: "m.naver.com" in u, 15)
             ch.wait_ready(15)
             search_from_home(ch, d, args.keyword2, tr)
