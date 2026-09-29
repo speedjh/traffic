@@ -1038,8 +1038,15 @@ def _try(ch: Chrome, url: str) -> bool:
 def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
     log("[*] 로테이션 시작 전 데이터·IP 확인")
     if not ds.ensure_network(args.serial, timeout=args.recover_secs):
-        log("[!] 연결 미확인 → Chrome 진입 생략")
-        return False, False, None
+        # IP 변경 직후 망이 늦게 붙는 경우가 있다 — 데이터를 한 번 더 껐다 켜고 재확인
+        log("[*] 연결 미확인 → 데이터 재토글 후 1회 재확인")
+        try:
+            ds.toggle_mobile_data(args.serial, off_secs=args.off_secs, recover_timeout=args.recover_secs)
+        except Exception as e:
+            log(f"[!] 데이터 재토글 실패: {e}")
+        if not ds.ensure_network(args.serial, timeout=args.recover_secs):
+            log("[!] 연결 미확인 → Chrome 진입 생략")
+            return False, False, None
 
     try:
         ch = launch_chrome(d, args.serial)
