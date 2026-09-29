@@ -394,17 +394,26 @@ def _adb(serial: str, *args, timeout: float = 25.0) -> subprocess.CompletedProce
     )
 
 
+PUBLIC_IP_URLS = (
+    "https://api.ipify.org",
+    "https://icanhazip.com",
+    "https://ifconfig.me/ip",
+)
+
+
 def get_public_ip(serial: str, curl_timeout: int = 8) -> str:
-    """기기의 현재 공인 IPv4 조회 (api.ipify.org). 실패 시 빈 문자열."""
-    try:
-        r = _adb(serial, "shell", "curl", "-s", "--max-time", str(curl_timeout),
-                 "https://api.ipify.org", timeout=curl_timeout + 5)
-        ip = (r.stdout or "").strip()
-        if ip and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
-            return ip
-        return ""
-    except Exception:
-        return ""
+    """기기의 현재 공인 IPv4 조회. 한 곳이 느리거나 막혀도 연결을 '끊김'으로 오판하지 않도록
+    여러 조회처를 순서대로 시도한다. 실패 시 빈 문자열."""
+    for url in PUBLIC_IP_URLS:
+        try:
+            r = _adb(serial, "shell", "curl", "-s", "-4", "--max-time", str(curl_timeout),
+                     url, timeout=curl_timeout + 5)
+            ip = (r.stdout or "").strip()
+            if ip and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                return ip
+        except Exception:
+            continue
+    return ""
 
 
 def _mobile_data_enabled(serial: str) -> bool:
