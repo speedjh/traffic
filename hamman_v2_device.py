@@ -393,11 +393,26 @@ class Tracer:
 # 크롬 실행 / 초기화
 # ══════════════════════════════════════════════════════════════════════════
 def launch_chrome(d: u2.Device, serial: str) -> Chrome:
+    """탭이 안 잡히면(온보딩 단계에서 멈추는 경우) 한 번 더 띄워 본다."""
     try:
         from device_screen import ensure_screen_ready
         ensure_screen_ready(serial, log=log)
     except Exception as e:
         log(f"[!] 화면 준비 스킵: {e}")
+    for attempt in range(2):
+        try:
+            return _launch_chrome_once(d, serial, 40 if attempt == 0 else 30)
+        except RuntimeError as e:
+            if attempt == 0:
+                log(f"[!] {e} → Chrome 강제 종료 후 재시도")
+                adb(serial, "shell", "am", "force-stop", CHROME_PKG)
+                time.sleep(2.0)
+            else:
+                raise
+    raise RuntimeError("Chrome 실행 실패")
+
+
+def _launch_chrome_once(d: u2.Device, serial: str, wait_secs: float) -> Chrome:
     log("[*] Chrome 실행")
     adb(serial, "shell", "am", "force-stop", CHROME_PKG)
     time.sleep(0.4)
@@ -405,7 +420,7 @@ def launch_chrome(d: u2.Device, serial: str) -> Chrome:
         "-c", "android.intent.category.LAUNCHER", "-n", v1.CHROME_MAIN)
     ch = Chrome(serial)
     ch.forward()
-    end = time.time() + 40
+    end = time.time() + wait_secs
     fre = False
     while time.time() < end:
         # 초기화 직후라면 온보딩(FRE) 이 뜬다 — V1 과 동일하게 처리
@@ -996,7 +1011,11 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
         log("[!] 연결 미확인 → Chrome 진입 생략")
         return False, False, None
 
-    ch = launch_chrome(d, args.serial)
+    try:
+        ch = launch_chrome(d, args.serial)
+    except Exception as e:
+        log(f"[!] Chrome 실행 실패: {e}")
+        return False, True, None
     try:
         # 이전 실행 잔여 쿠키가 디스크에서 되살아났을 수 있으므로 시작 전에도 한 번 비운다
         reset_identity(ch, final=False)
