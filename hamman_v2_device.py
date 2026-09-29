@@ -682,6 +682,33 @@ def classify(href: str) -> str:
     return "web"
 
 
+BAD_URL_FILE = ROOT / "campaign_web" / "logs" / "v2_stuck_urls.txt"
+
+
+def stuck_urls() -> set:
+    """크롬을 굳게 만든 적이 있는 글 — 다시 고르지 않는다."""
+    try:
+        return {l.strip() for l in BAD_URL_FILE.read_text(encoding="utf-8").splitlines() if l.strip()}
+    except Exception:
+        return set()
+
+
+def remember_stuck(url: str) -> None:
+    url = (url or "").split("?")[0]
+    if not url.startswith("http"):
+        return
+    try:
+        cur = stuck_urls()
+        if url in cur:
+            return
+        BAD_URL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(BAD_URL_FILE, "a", encoding="utf-8") as f:
+            f.write(url + chr(10))
+        log(f"    ... 이 글은 크롬이 굳어 다음부터 제외: {url[:70]}")
+    except Exception:
+        pass
+
+
 def article_tier(href: str) -> int:
     """0=블로그·카페·인플루언서·포스트(최우선) 1=뉴스·지식iN 2=외부 웹문서."""
     host = (urlparse(href).hostname or "").lower()
@@ -695,6 +722,7 @@ def article_tier(href: str) -> int:
 def pick_target(ch: Chrome, stats: Optional[dict] = None) -> Optional[dict]:
     """문서 순서상 위쪽의 글 제목 링크. 블로그·카페 우선 → 뉴스·지식iN → 외부 웹문서."""
     links = ch.cdp.eval(JS_LINKS, timeout=12) or []
+    bad = stuck_urls()
     by_href: Dict[str, dict] = {}
     cnt = {"links": len(links), "ad": 0, "bad": 0, "short": 0}
     for l in links:
@@ -710,6 +738,8 @@ def pick_target(ch: Chrome, stats: Optional[dict] = None) -> Optional[dict]:
             cnt["short"] += 1
             continue
         key = l["href"].split("#")[0]
+        if key.split("?")[0] in bad:
+            continue
         if key not in by_href:
             by_href[key] = dict(l, kind=k, tier=article_tier(l["href"]))
     if stats is not None:
@@ -1040,6 +1070,7 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
         if not open_article(ch, d, "1차", tr):
             return False, True, ch
         tr.shot("page1")
+        stuck_at = ch.url()          # 굳을 경우 이 글을 기록해 다음부터 제외
         dwell(ch, d, args.dwell_min, args.dwell_max, args.dwell_scrolls)
 
         # 2차 — 뒤로 가서 검색결과 상단 검색창으로
@@ -1049,11 +1080,17 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
             try:
                 ch.cdp.send("Page.navigate", {"url": NAVER_HOME_URL, "transitionType": "typed"})
             except Exception:
-                # 탭이 굳었으면 재연결도 소용없다 → 새 탭에서 연다
+                # 탭이 굳었으면 재연결도 소용없다 → 새 탭, 그래도 안 되면 크롬을 다시 띄운다
+                remember_stuck(stuck_at)
                 if not (ch.reconnect() and _try(ch, NAVER_HOME_URL)):
                     if not ch.open_in_new_tab(NAVER_HOME_URL):
-                        raise
-            ch.wait_url(lambda u: "m.naver.com" in u, 15)
+                        log("    ... 브라우저가 굳음 → Chrome 재실행")
+                        keep = (dict(ch.phase_bytes), ch.bytes)
+                        ch.close()
+                        ch = launch_chrome(d, args.serial)
+                        ch.phase_bytes, ch.bytes = keep
+                        ch.cdp.send("Page.navigate", {"url": NAVER_HOME_URL, "transitionType": "typed"})
+            ch.wait_url(lambda u: "m.naver.com" in u, 20)
             ch.wait_ready(15)
             search_from_home(ch, d, args.keyword2, tr)
         else:
