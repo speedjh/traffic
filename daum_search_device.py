@@ -401,7 +401,7 @@ PUBLIC_IP_URLS = (
 )
 
 
-def get_public_ip(serial: str, curl_timeout: int = 8) -> str:
+def get_public_ip(serial: str, curl_timeout: int = 5) -> str:
     """기기의 현재 공인 IPv4 조회. 한 곳이 느리거나 막혀도 연결을 '끊김'으로 오판하지 않도록
     여러 조회처를 순서대로 시도한다. 실패 시 빈 문자열."""
     for url in PUBLIC_IP_URLS:
@@ -464,7 +464,7 @@ def ensure_network(serial: str, timeout: float = 20.0) -> bool:
             _adb(serial, "shell", "svc", "data", "enable", timeout=8)
             time.sleep(1.5)
             continue
-        ip = get_public_ip(serial, curl_timeout=6)
+        ip = get_public_ip(serial, curl_timeout=4)
         if ip:
             log(f"[+] 데이터·IP 연결 확인 ({ip})")
             return True

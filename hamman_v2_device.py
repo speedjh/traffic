@@ -1044,7 +1044,8 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
             ds.toggle_mobile_data(args.serial, off_secs=args.off_secs, recover_timeout=args.recover_secs)
         except Exception as e:
             log(f"[!] 데이터 재토글 실패: {e}")
-        if not ds.ensure_network(args.serial, timeout=args.recover_secs):
+        # 재접속은 더 오래 걸릴 수 있어 대기를 넉넉히 준다
+        if not ds.ensure_network(args.serial, timeout=max(args.recover_secs * 2, 45)):
             log("[!] 연결 미확인 → Chrome 진입 생략")
             return False, False, None
 
