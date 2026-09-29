@@ -416,6 +416,21 @@ def get_public_ip(serial: str, curl_timeout: int = 5) -> str:
     return ""
 
 
+def network_ok(serial: str, timeout: int = 6) -> bool:
+    """공인 IP 조회가 안 되더라도 실제 통신이 되는지 확인 (네이버 응답 코드).
+    IP 에코 서비스가 느리거나 막혀 '연결 끊김'으로 오판하는 것을 막는다."""
+    for url in ("https://m.naver.com", "https://www.google.com/generate_204"):
+        try:
+            r = _adb(serial, "shell", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                     "--max-time", str(timeout), url, timeout=timeout + 5)
+            code = (r.stdout or "").strip()[-3:]
+            if code.isdigit() and int(code) in (200, 204, 301, 302):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _mobile_data_enabled(serial: str) -> bool:
     """settings global mobile_data 상태 (1=켜짐)."""
     try:

@@ -1046,8 +1046,12 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
             log(f"[!] 데이터 재토글 실패: {e}")
         # 재접속은 더 오래 걸릴 수 있어 대기를 넉넉히 준다
         if not ds.ensure_network(args.serial, timeout=max(args.recover_secs * 2, 45)):
-            log("[!] 연결 미확인 → Chrome 진입 생략")
-            return False, False, None
+            # IP 조회만 안 되는 것일 수 있다 — 실제 통신이 되면 진행
+            if ds.network_ok(args.serial):
+                log("[*] 공인 IP 조회는 실패했지만 통신은 정상 → 진행")
+            else:
+                log("[!] 연결 미확인 → Chrome 진입 생략")
+                return False, False, None
 
     try:
         ch = launch_chrome(d, args.serial)
