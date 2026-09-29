@@ -29,3 +29,5 @@ UPDATE campaigns SET params_json=json_remove(params_json,'$.engine') WHERE statu
 ## 기록
 - 06:5x 1단계 실행: #44, #16 → engine=v2
 - (이후 결과는 아침 보고에 정리)
+- 07:45 2단계 실행: #25 경주축제, #30 민락2지구술집, #40 경주데이트 → engine=v2 (활성 13개 전부 V2)
+  - 1단계 판정: 대구예물 6/6, 경주여행 6/6 성공 → 통과
