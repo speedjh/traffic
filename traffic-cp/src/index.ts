@@ -638,7 +638,17 @@ const TRAFFIC_TYPES: { key: string; label: string; description: string }[] = [
   { key: 'hamman_find', label: '함많찾을', description: 'Chrome에서 네이버 검색 → 결과 클릭·체류 → 2차 키워드 검색·클릭·체류 → Chrome 초기화 → IP 변경.' },
 ]
 const trafficLabel = (k: string) => TRAFFIC_TYPES.find((t) => t.key === k)?.label ?? k
-const DWELL_TYPES = ['kakao_search', 'hamman_find']
+/** 함많찾을은 params.engine 으로 V1/V2 스크립트가 갈린다 (campaign_web/traffic.py) */
+const isV2 = (paramsJson: any) => { try { return String(JSON.parse(paramsJson || '{}').engine || '').toLowerCase() === 'v2' } catch { return false } }
+const campLabel = (type: string, paramsJson: any) =>
+  type === 'hamman_find' ? (isV2(paramsJson) ? '함많찾을 V2' : '함많찾을 V1') : trafficLabel(type)
+// 생성 화면 선택지 — 함많찾을 V2 는 traffic_type=hamman_find + params.engine=v2 로 저장
+const HAMMAN_V2_KEY = 'hamman_find_v2'
+const FORM_TYPES = TRAFFIC_TYPES.flatMap((t) => t.key !== 'hamman_find' ? [t] : [
+  { key: HAMMAN_V2_KEY, label: '함많찾을 V2 (권장)', description: 'Chrome DevTools로 링크 목적지를 확인해 글만 정밀 클릭(광고·플레이스 제외) + 쿠키·스토리지만 초기화하고 캐시는 유지해 건당 데이터 6~11MB. 흐름은 V1과 동일.' },
+  { ...t, label: '함많찾을 V1', description: t.description + ' (구버전 · pm clear 로 매번 전체 초기화, 건당 30~40MB)' },
+])
+const DWELL_TYPES = ['kakao_search', 'hamman_find', HAMMAN_V2_KEY]
 
 const esc = (s: any) => String(s ?? '').replace(/[&<>"']/g, (ch) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as any)[ch])
@@ -661,7 +671,8 @@ app.get('/campaigns/new', (c) => c.html(page('캠페인 생성', campaignFormHtm
 app.post('/campaigns/new', async (c) => {
   const f: any = await c.req.parseBody()
   try {
-    const name = String(f.name || '').trim(), type = String(f.traffic_type || '')
+    const name = String(f.name || '').trim(), picked = String(f.traffic_type || '')
+    const type = picked === HAMMAN_V2_KEY ? 'hamman_find' : picked
     const quota = Number(f.daily_quota), days = Number(f.days), start = String(f.start_date || kstToday())
     if (!name) throw new Error('캠페인 이름을 입력하세요')
     if (!TRAFFIC_TYPES.some((t) => t.key === type)) throw new Error('지원하지 않는 트래픽 종류')
@@ -674,6 +685,7 @@ app.post('/campaigns/new', async (c) => {
       params.dwell_min = dmin; params.dwell_max = dmax
       if (type === 'hamman_find' && placeName) params.keyword2 = placeName
     }
+    if (picked === HAMMAN_V2_KEY) params.engine = 'v2'
     const r = await c.env.DB.prepare(`INSERT INTO campaigns (name,traffic_type,keyword,place_url,place_name,daily_quota,start_date,days,status,params_json)
        VALUES (?,?,?,?,?,?,?,?, 'active', ?)`).bind(name, type, String(f.keyword || '').trim(), String(f.place_url || '').trim(),
       placeName, quota, start, days, JSON.stringify(params)).run()
@@ -715,6 +727,10 @@ app.post('/campaigns/:id/settings', async (c) => {
         if (v) params.keyword2 = v; else delete params.keyword2
         touchedParams = true
       }
+    }
+    if (f.engine !== undefined && camp.traffic_type === 'hamman_find') {
+      if (String(f.engine) === 'v2') params.engine = 'v2'; else delete params.engine
+      touchedParams = true
     }
     const dmin = toNum(f.dwell_min), dmax = toNum(f.dwell_max)
     if (dmin !== null || dmax !== null) {
@@ -765,7 +781,7 @@ app.post('/campaigns/:id/resume', async (c) => {
 // ── 작업큐 ──
 app.get('/queue', async (c) => {
   const day = /^\d{4}-\d{2}-\d{2}$/.test(c.req.query('day') || '') ? c.req.query('day')! : kstToday()
-  const rows = await c.env.DB.prepare(`SELECT j.*, c.name campaign_name, c.traffic_type FROM jobs j JOIN campaigns c ON c.id=j.campaign_id
+  const rows = await c.env.DB.prepare(`SELECT j.*, c.name campaign_name, c.traffic_type, c.params_json FROM jobs j JOIN campaigns c ON c.id=j.campaign_id
       WHERE j.schedule_date=? ORDER BY j.queue_seq ASC LIMIT 3000`).bind(day).all()
   return c.html(page('작업큐', queueHtml(day, rows.results || []), '/queue'))
 })
@@ -855,7 +871,7 @@ async function dashHtml(db: D1Database) {
 
   const campRows = camps.map((c: any) => `<tr class="clickable-row" onclick="location.href='/campaigns/${c.id}'" title="설정 보기">
     <td><strong><a href="/campaigns/${c.id}" onclick="event.stopPropagation()">${esc(c.name)}</a></strong></td>
-    <td>${esc(trafficLabel(c.traffic_type))}</td><td>${badge(c.status)}</td><td>${c.daily_quota}</td>
+    <td>${esc(campLabel(c.traffic_type, c.params_json))}</td><td>${badge(c.status)}</td><td>${c.daily_quota}</td>
     <td>${c.done}/${c.planned} <span class="muted">(fail ${c.fail})</span></td>
     <td>${esc(c.start_date)} · ${c.days}일</td>
     <td onclick="event.stopPropagation()">${c.status === 'active'
@@ -897,7 +913,7 @@ ${error ? `<div class="error">${esc(error)}</div>` : ''}
     <div class="field"><label>일수</label><input type="number" name="days" min="1" value="5" required />
       <div class="help">시작일부터 N일. 5일이면 시작일~시작일+4일.</div></div>
     <div class="field full"><label>트래픽 종류</label><div class="traffic-cards">
-      ${TRAFFIC_TYPES.map((t, i) => `<label class="traffic-option"><input type="radio" name="traffic_type" value="${t.key}"${i === 0 ? ' checked' : ''} required />
+      ${FORM_TYPES.map((t, i) => `<label class="traffic-option"><input type="radio" name="traffic_type" value="${t.key}"${i === 0 ? ' checked' : ''} required />
         <span><strong>${esc(t.label)}</strong><span class="desc">${esc(t.description)}</span></span></label>`).join('')}
     </div></div>
     <div class="field"><label>키워드</label><input name="keyword" placeholder="검색 키워드" /></div>
@@ -937,7 +953,7 @@ async function campaignDetailHtml(db: D1Database, id: number, flash: string | nu
 ${flash ? `<div class="ok">${esc(flash)}</div>` : ''}${error ? `<div class="error">${esc(error)}</div>` : ''}
 <div class="panel"><h2>기본</h2><table class="kv">
   <tr><th>상태</th><td>${badge(c.status)}</td></tr>
-  <tr><th>트래픽</th><td>${esc(trafficLabel(c.traffic_type))} <span class="muted">(${esc(c.traffic_type)})</span></td></tr>
+  <tr><th>트래픽</th><td>${esc(campLabel(c.traffic_type, c.params_json))} <span class="muted">(${esc(c.traffic_type)})</span></td></tr>
   <tr><th>일유입량</th><td>${c.daily_quota}회/일</td></tr>
   <tr><th>기간</th><td>${esc(c.start_date)} ~ ${campaignEnd(c)} (${c.days}일)</td></tr>
   <tr><th>생성시각</th><td class="muted">${esc(c.created_at)}</td></tr>
@@ -966,6 +982,10 @@ ${editable ? `<form class="panel" method="post" action="/campaigns/${id}/setting
     <div class="field"><label>${isHam ? '2차 키워드' : '업체명 / 2차 키워드'}</label>
       <input name="keyword2" value="${esc(kw2)}" placeholder="예: 수유소고기 청가숯불구이" />
       <div class="help">${isHam ? '함많찾을 2차 검색어 (<code>--keyword2</code>). place_name 과 함께 저장됩니다.' : '카카오맵 업체명 등. 함많찾을이면 2차 검색어로도 씁니다.'}</div></div>
+    ${isHam ? `<div class="field full"><label>함많찾을 버전</label><select name="engine">
+      <option value="v2"${isV2(c.params_json) ? ' selected' : ''}>V2 — 정밀 클릭 + 캐시 유지 (권장)</option>
+      <option value="v1"${isV2(c.params_json) ? '' : ' selected'}>V1 — 구버전 (pm clear)</option></select>
+      <div class="help">다음에 claim 되는 job부터 해당 버전 스크립트로 실행됩니다. 워커 재시작 불필요.</div></div>` : ''}
     <div class="field full"><label>장소 URL</label><input name="place_url" value="${esc(c.place_url)}" placeholder="https://place.map.kakao.com/..." /></div>
     ${showDwell ? `<div class="field"><label>체류 최소(초)</label><input type="number" name="dwell_min" min="1" step="1" value="${esc(params.dwell_min ?? 15)}" /></div>
     <div class="field"><label>체류 최대(초)</label><input type="number" name="dwell_max" min="1" step="1" value="${esc(params.dwell_max ?? 20)}" />
@@ -1024,7 +1044,7 @@ function queueHtml(day: string, jobs: any[]) {
 </form>
 <div class="panel"><h2>${day} · ${jobs.length} jobs</h2>${jobs.length ? `<table>
 <thead><tr><th>Seq</th><th>캠페인</th><th>트래픽</th><th>예정시각</th><th>상태</th><th>기기</th></tr></thead><tbody>
-${jobs.map((j) => `<tr><td>${j.queue_seq}</td><td>${esc(j.campaign_name)}</td><td>${esc(trafficLabel(j.traffic_type))}</td>
+${jobs.map((j) => `<tr><td>${j.queue_seq}</td><td>${esc(j.campaign_name)}</td><td>${esc(campLabel(j.traffic_type, j.params_json))}</td>
 <td class="muted">${esc(j.scheduled_at || '-')}</td><td>${badge(j.status)}</td><td class="muted">${esc(j.device_serial || '-')}</td></tr>`).join('')}
 </tbody></table>` : '<p class="muted">이 날짜의 job이 없습니다.</p>'}</div>`
 }
