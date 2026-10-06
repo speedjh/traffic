@@ -378,13 +378,46 @@ app.get('/api/events', async (c) => {
   return c.json(rows.results || [])
 })
 
+// ── 캠페인 변경 이력 ─────────────────────────────────────────────────────
+const parseParams = (c: any) => { try { return JSON.parse(c?.params_json || '{}') } catch { return {} } }
+/** [필드, 화면 이름, 값 추출] — 변경 전/후 스냅샷을 이 기준으로 비교해 달라진 항목만 남긴다 */
+const HIST_FIELDS: [string, string, (c: any) => string][] = [
+  ['name', '이름', (c) => c.name ?? ''],
+  ['status', '상태', (c) => c.status ?? ''],
+  ['keyword', '키워드', (c) => c.keyword ?? ''],
+  ['keyword2', '2차 키워드', (c) => parseParams(c).keyword2 || c.place_name || ''],
+  ['place_url', '장소 URL', (c) => c.place_url ?? ''],
+  ['daily_quota', '일유입량', (c) => String(c.daily_quota ?? '')],
+  ['days', '일수', (c) => String(c.days ?? '')],
+  ['start_date', '시작일', (c) => c.start_date ?? ''],
+  ['dwell', '체류(초)', (c) => { const p = parseParams(c); return p.dwell_min != null ? `${p.dwell_min}~${p.dwell_max}` : '' }],
+  ['engine', '함많찾을 버전', (c) => c.traffic_type === 'hamman_find' ? (String(parseParams(c).engine || '').toLowerCase() === 'v2' ? 'V2' : 'V1') : ''],
+]
+const getCampaign = (db: D1Database, id: number) => db.prepare('SELECT * FROM campaigns WHERE id=?').bind(id).first<any>()
+
+/** before=null 이면 생성(채워진 항목 전부 기록), 아니면 달라진 항목만 기록 */
+async function recordChanges(db: D1Database, before: any, after: any, action: string, source: string) {
+  if (!after) return
+  const now = nowIso(), stmts = []
+  for (const [field, label, get] of HIST_FIELDS) {
+    const nv = get(after), ov = before ? get(before) : null
+    if (before ? ov === nv : nv === '') continue
+    stmts.push(db.prepare(`INSERT INTO campaign_history (campaign_id,changed_at,action,field,label,old_value,new_value,source)
+      VALUES (?,?,?,?,?,?,?,?)`).bind(after.id, now, action, field, label, ov, nv, source))
+  }
+  if (stmts.length) await db.batch(stmts)
+}
+
 // 만료 캠페인 자동 paused
 async function expirePastCampaigns(db: D1Database) {
   const today = kstToday()
-  const rows = await db.prepare(`SELECT id, start_date, days FROM campaigns WHERE status='active'`).all()
+  const rows = await db.prepare(`SELECT * FROM campaigns WHERE status='active'`).all()
   for (const c of rows.results || []) {
     const end = addDays((c as any).start_date, Math.max((c as any).days, 1) - 1)
-    if (end < today) await db.prepare(`UPDATE campaigns SET status='paused' WHERE id=?`).bind((c as any).id).run()
+    if (end < today) {
+      await db.prepare(`UPDATE campaigns SET status='paused' WHERE id=?`).bind((c as any).id).run()
+      await recordChanges(db, c, { ...c, status: 'paused' }, '기간 만료', '자동')
+    }
   }
 }
 
@@ -513,6 +546,7 @@ app.post('/api/campaigns', async (c) => {
     b.name, b.traffic_type, b.keyword || '', b.place_url || '', b.place_name || '',
     b.daily_quota, start, b.days, JSON.stringify(b.params || {})).run()
   const cid = r.meta.last_row_id
+  await recordChanges(db, null, await getCampaign(db, Number(cid)), '생성', 'API')
   // materialize
   for (let d = 0; d < b.days; d++) {
     const day = addDays(start, d)
@@ -534,12 +568,13 @@ app.post('/api/campaigns/import-json', async (c) => {
   const db = c.env.DB
   let created = 0, updated = 0
   for (const r of rows) {
-    const ex = await db.prepare('SELECT id FROM campaigns WHERE id=? OR name=?').bind(r.id ?? -1, r.name).first<any>()
+    const ex = await db.prepare('SELECT * FROM campaigns WHERE id=? OR name=?').bind(r.id ?? -1, r.name).first<any>()
     const vals = [r.name, r.traffic_type, r.keyword || '', r.place_url || '', r.place_name || '',
       r.daily_quota ?? 0, r.start_date || '', r.days ?? 1, r.status || 'paused', r.params_json || '{}']
     if (ex) {
       await db.prepare(`UPDATE campaigns SET name=?, traffic_type=?, keyword=?, place_url=?, place_name=?,
         daily_quota=?, start_date=?, days=?, status=?, params_json=? WHERE id=?`).bind(...vals, ex.id).run()
+      await recordChanges(db, ex, await getCampaign(db, ex.id), '설정 가져오기', 'API')
       updated++
     } else if (r.id) {
       await db.prepare(`INSERT INTO campaigns (id,name,traffic_type,keyword,place_url,place_name,daily_quota,start_date,days,status,params_json)
@@ -561,6 +596,7 @@ app.post('/api/campaigns/:id/activate', async (c) => {
   if (!camp) return c.json({ error: 'not found' }, 404)
   const start = kstToday()
   await db.prepare(`UPDATE campaigns SET status='active', start_date=? WHERE id=?`).bind(start, id).run()
+  await recordChanges(db, camp, await getCampaign(db, id), '활성화', 'API')
   await db.prepare('DELETE FROM jobs WHERE campaign_id=? AND status=?').bind(id, 'pending').run()
   for (let d = 0; d < camp.days; d++) {
     const day = addDays(start, d)
@@ -574,7 +610,7 @@ app.post('/api/campaigns/:id/activate', async (c) => {
 })
 
 app.post('/api/campaigns/:id/pause', async (c) => {
-  await pauseCampaign(c.env.DB, Number(c.req.param('id')))
+  await pauseCampaign(c.env.DB, Number(c.req.param('id')), 'API')
   return c.json({ ok: true })
 })
 
@@ -608,8 +644,10 @@ async function syncCampaignJobs(db: D1Database, id: number) {
 }
 
 /** 중단(일시정지): 남은 대기/리스 job 을 paused 로 보관. 실행 중 job 은 워커 runnable 검사에서 멈춘다. */
-async function pauseCampaign(db: D1Database, id: number) {
+async function pauseCampaign(db: D1Database, id: number, source = '대시보드') {
+  const before = await getCampaign(db, id)
   await db.prepare(`UPDATE campaigns SET status='paused', updated_at=? WHERE id=?`).bind(nowIso(), id).run()
+  await recordChanges(db, before, await getCampaign(db, id), '중단', source)
   await db.prepare(`UPDATE jobs SET status='paused', device_serial=NULL, worker_id=NULL, leased_at=NULL
       WHERE campaign_id=? AND status IN ('pending','leased')`).bind(id).run()
 }
@@ -617,9 +655,11 @@ async function pauseCampaign(db: D1Database, id: number) {
 /** 재개: 오늘부터 N일로 기간을 새로 잡고 이전 대기분을 정리한 뒤 큐 생성. */
 async function resumeCampaign(db: D1Database, id: number, quota: number, days: number) {
   if (!(quota >= 1 && days >= 1 && days <= 365)) throw new Error('일유입량·일수는 1 이상이어야 합니다 (일수 최대 365)')
+  const before = await getCampaign(db, id)
   await db.prepare(`DELETE FROM jobs WHERE campaign_id=? AND status IN ('pending','paused','leased')`).bind(id).run()
   await db.prepare(`UPDATE campaigns SET status='active', daily_quota=?, days=?, start_date=?, updated_at=? WHERE id=?`)
     .bind(quota, days, kstToday(), nowIso(), id).run()
+  await recordChanges(db, before, await getCampaign(db, id), '재개', '대시보드')
   await syncCampaignJobs(db, id)
 }
 
@@ -659,6 +699,8 @@ function kstDayUtcRange(day: string): [string, string] {
   const f = (t: number) => new Date(t).toISOString().replace('T', ' ').slice(0, 19)
   return [f(s), f(s + 86400000)]
 }
+/** UTC 'YYYY-MM-DD HH:MM:SS' → KST 'YYYY-MM-DD HH:MM' */
+const kstStamp = (utc: string) => { const t = new Date(String(utc).replace(' ', 'T') + 'Z').getTime(); return isNaN(t) ? String(utc) : new Date(t + KST_OFFSET).toISOString().replace('T', ' ').slice(0, 16) }
 const toNum = (v: any) => (v === undefined || v === null || String(v).trim() === '' ? null : Number(v))
 
 app.get('/', async (c) => c.html(page('대시보드', await dashHtml(c.env.DB), '/')))
@@ -689,6 +731,7 @@ app.post('/campaigns/new', async (c) => {
     const r = await c.env.DB.prepare(`INSERT INTO campaigns (name,traffic_type,keyword,place_url,place_name,daily_quota,start_date,days,status,params_json)
        VALUES (?,?,?,?,?,?,?,?, 'active', ?)`).bind(name, type, String(f.keyword || '').trim(), String(f.place_url || '').trim(),
       placeName, quota, start, days, JSON.stringify(params)).run()
+    await recordChanges(c.env.DB, null, await getCampaign(c.env.DB, Number(r.meta.last_row_id)), '생성', '대시보드')
     await syncCampaignJobs(c.env.DB, Number(r.meta.last_row_id))
     return c.redirect('/', 303)
   } catch (e: any) {
@@ -742,6 +785,7 @@ app.post('/campaigns/:id/settings', async (c) => {
     if (!sets.length) throw new Error('변경할 항목이 없습니다')
     sets.push('updated_at=?'); vals.push(nowIso())
     await db.prepare(`UPDATE campaigns SET ${sets.join(',')} WHERE id=?`).bind(...vals, id).run()
+    await recordChanges(db, camp, await getCampaign(db, id), '설정 수정', '대시보드')
     if (pacing) {
       await expirePastCampaigns(db)
       await syncCampaignJobs(db, id)
@@ -942,6 +986,8 @@ async function campaignDetailHtml(db: D1Database, id: number, flash: string | nu
   const failed = await n(`SELECT COUNT(*) n FROM jobs WHERE campaign_id=? AND status='failed' AND finished_at>=? AND finished_at<?`, id, ds, de)
   const pending = await n(`SELECT COUNT(*) n FROM jobs WHERE campaign_id=? AND schedule_date=? AND status='pending'`, id, today)
   const planned = (await n(`SELECT COUNT(*) n FROM jobs WHERE campaign_id=? AND schedule_date=? AND status!='paused'`, id, today)) || c.daily_quota
+  const hist = (await db.prepare(`SELECT * FROM campaign_history WHERE campaign_id=? ORDER BY changed_at DESC, id DESC LIMIT 200`)
+    .bind(id).all()).results || []
   const fails = (await db.prepare(`SELECT id, finished_at, error_message, device_serial FROM jobs WHERE campaign_id=? AND status='failed'
       AND finished_at>=? AND finished_at<? ORDER BY finished_at DESC LIMIT 8`).bind(id, ds, de).all()).results || []
   const params = JSON.parse(c.params_json || '{}')
@@ -998,6 +1044,10 @@ ${editable ? `<form class="panel" method="post" action="/campaigns/${id}/setting
   <tr><th>${isHam ? '2차 키워드' : '업체명'}</th><td>${esc(kw2 || '—')}</td></tr>
   <tr><th>장소 URL</th><td>${c.place_url ? `<a href="${esc(c.place_url)}" target="_blank" rel="noopener">${esc(c.place_url)}</a>` : '—'}</td></tr>
 </table></div>
+<div class="panel"><h2>변경 이력</h2>${hist.length ? `<table><thead><tr><th>시각(KST)</th><th>구분</th><th>항목</th><th>이전</th><th></th><th>변경</th><th>출처</th></tr></thead><tbody>
+  ${hist.map((h: any) => `<tr><td class="muted" style="white-space:nowrap">${esc(kstStamp(h.changed_at))}</td><td>${esc(h.action)}</td><td><strong>${esc(h.label || h.field)}</strong></td>
+    <td class="muted">${h.old_value == null ? '—' : esc(h.old_value || '(비어 있음)')}</td><td class="muted">→</td><td>${esc(h.new_value || '(비어 있음)')}</td><td class="muted">${esc(h.source)}</td></tr>`).join('')}
+  </tbody></table>` : '<p class="muted">기록된 변경 이력이 없습니다.</p>'}</div>
 <div class="panel"><h2>추가 파라미터</h2>${Object.keys(params).length
     ? `<table class="kv">${Object.entries(params).map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(typeof v === 'object' ? JSON.stringify(v) : v)}</td></tr>`).join('')}</table>`
     : '<p class="muted">추가 파라미터 없음</p>'}</div>
