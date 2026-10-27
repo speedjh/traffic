@@ -59,21 +59,19 @@ export async function checkAlerts(env: AlertEnv) {
     const kFail = `${d.serial}:fail_streak`
     if (streak && !active.get(kFail)) {
       const err = (recent[0]?.error_message || '').slice(0, 120)
-      lines.push(`⚠️ ${name} 작업 ${FAIL_STREAK}회 연속 실패${err ? ` — ${err}` : ''}`)
+      lines.push(`⚠️ 휴대폰 ${name} — 작업이 ${FAIL_STREAK}번 연속 실패했습니다.\n   → 휴대폰 화면에 팝업·오류가 떠 있는지 확인해 주세요.${err ? `\n   (오류 내용: ${err})` : ''}`)
       await setState(kFail, true)
     } else if (!streak && active.get(kFail) && recent[0]?.status === 'success') {
       await setState(kFail, false)
     }
   }
 
-  // 새로 끊긴 기기 — 전부 끊겼으면 PC/fleet 문제로 묶어서 알린다
+  // 새로 끊긴 기기 — 전부 끊겼으면 PC/프로그램 문제로 묶어서 알린다 (직원이 보는 문구라 쉬운 말로)
   const live = devs.filter((d) => !d.paused)
   if (offlineNames.length && offlineNames.length === live.length) {
-    lines.unshift(`🔴 기기 전체 응답 없음 — PC 꺼짐 또는 fleet 중단 추정
-   ${offlineNames.join(', ')}`)
+    lines.unshift(`🔴 휴대폰 전체 작업 멈춤 — PC가 꺼졌거나 작업 프로그램이 꺼졌습니다.\n   → PC가 켜져 있는지, 작업 프로그램 창이 떠 있는지 확인해 주세요.\n   멈춘 휴대폰(마지막 작업 시각): ${offlineNames.join(', ')}`)
   } else if (offlineNames.length) {
-    lines.unshift(`🔴 기기 응답 없음 — 워커 중단 또는 기기 연결 끊김
-   ${offlineNames.join(', ')}`)
+    lines.unshift(`🔴 휴대폰 일부 작업 멈춤 — 휴대폰 연결이 빠졌거나 작업 프로그램에 문제가 생겼습니다.\n   → 해당 휴대폰의 USB 선 연결과 전원을 확인해 주세요.\n   멈춘 휴대폰(마지막 작업 시각): ${offlineNames.join(', ')}`)
   }
   await setState('_last_run', true)
 
