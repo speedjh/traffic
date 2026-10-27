@@ -8,5 +8,6 @@
     { "binding": "DB", "database_name": "traffic-cp", "database_id": "b8ea6672-5785-446f-8abb-9f70083c122c" }
   ],
   "browser": { "binding": "BROWSER" },
+  "triggers": { "crons": ["0 * * * *"] },
   "observability": { "enabled": true }
 }

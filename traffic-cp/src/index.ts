@@ -2,8 +2,9 @@
 // campaign_web(FastAPI) 이식: 계정풀(투입 오래된 순 할당) / 워커 API / 캠페인·큐 / 대시보드
 import { Hono } from 'hono'
 import { fetchKakaoCode } from './outlook'
+import { checkAlerts } from './alerts'
 
-type Env = { DB: D1Database; BROWSER: any }
+type Env = { DB: D1Database; BROWSER: any; TELEGRAM_BOT_TOKEN?: string; TELEGRAM_CHAT_ID?: string }
 const app = new Hono<{ Bindings: Env }>()
 
 // ── 시간 유틸 (KST 기준 날짜/시각) ─────────────────────────────────────────
@@ -1187,4 +1188,10 @@ load();setInterval(load,7000)
 </script>`
 
 app.get('/health', (c) => c.json({ ok: true, ts: nowIso() }))
-export default app
+export default {
+  fetch: app.fetch,
+  // 매시 정각 기기 상태 점검 → 텔레그램 알림
+  async scheduled(_ev: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(checkAlerts(env))
+  },
+}
