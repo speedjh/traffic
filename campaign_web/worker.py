@@ -47,6 +47,14 @@ def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+# 연속 실패 자동 복구 단계 — 10/31 SM-A826S 가 크롬 DevTools·화면분석 먹통 상태로 3일 반 동안
+# 같은 실패만 반복한 사고 대응. 사람 손 없이 기기 상태를 되돌린다.
+HEAL_SOFT_AT = 3          # 연속 실패 N회: 크롬·화면분석(uiautomator) 재시작
+HEAL_REBOOT_AT = 6        # 연속 실패 N회: 휴대폰 재부팅
+HEAL_REBOOT_GAP = 3 * 3600  # 재부팅 최소 간격 (재부팅해도 안 고쳐지는 문제로 무한 재부팅 방지)
+U2_AGENT_PKGS = ("com.github.uiautomator", "com.github.uiautomator.test")
+
+
 def _adb_bin() -> str:
     return dstat.ADB
 
@@ -95,6 +103,8 @@ class QueueWorker:
         self.state = "idle"
         self.state_detail = ""
         self.last_battery: Optional[int] = None
+        self.fail_streak = 0
+        self.last_reboot = 0.0
 
     def event(self, kind: str, message: str = ""):
         """대시보드 이벤트 로그 (다음 heartbeat 에 함께 전송)."""
@@ -449,6 +459,86 @@ class QueueWorker:
                             pass
                 return done("failed", str(e), str(log_path))
 
+    # ── 연속 실패 자동 복구 ────────────────────────────────────────────
+    def _sh(self, *args: str, timeout: float = 20.0) -> str:
+        try:
+            r = subprocess.run([_adb_bin(), "-s", self.serial, *args],
+                               capture_output=True, text=True, timeout=timeout)
+            return (r.stdout or "") + (r.stderr or "")
+        except Exception as e:
+            return str(e)
+
+    def after_job(self, status: str):
+        """작업 결과로 연속 실패를 세고, 쌓이면 단계적으로 기기를 복구한다."""
+        if status == "success":
+            if self.fail_streak >= HEAL_SOFT_AT:
+                self.event("self_heal_ok", f"연속 실패 {self.fail_streak}회 후 정상 복귀")
+            self.fail_streak = 0
+            return
+        if status != "failed":
+            return
+        self.fail_streak += 1
+        n = self.fail_streak
+        if n >= HEAL_REBOOT_AT and time.time() - self.last_reboot >= HEAL_REBOOT_GAP:
+            self.heal_reboot(n)
+        elif n == HEAL_SOFT_AT or (n > HEAL_SOFT_AT and n % HEAL_SOFT_AT == 0):
+            self.heal_soft(n)
+
+    def heal_soft(self, n: int):
+        """크롬 강제 종료 + 화면분석 에이전트 재시작 + 홈 화면. 다음 작업 때 u2 가 에이전트를 새로 띄운다."""
+        log(f"[*] 연속 실패 {n}회 → 크롬·화면분석 재시작")
+        self.event("self_heal", f"연속 실패 {n}회 — 크롬·화면분석 재시작")
+        self._sh("shell", "am", "force-stop", "com.android.chrome")
+        for pkg in U2_AGENT_PKGS:
+            self._sh("shell", "am", "force-stop", pkg)
+        # u2 3.x 는 apk 대신 app_process 로 jar 를 띄운다 — 프로세스를 직접 종료
+        self._sh("shell", "pkill", "-f", "uiautomator")
+        self._sh("shell", "input", "keyevent", "KEYCODE_HOME")
+        try:
+            dstat.clear_screen_blockers(self.serial, log=log)
+        except Exception:
+            pass
+        time.sleep(3.0)
+
+    def heal_reboot(self, n: int):
+        """휴대폰 재부팅 후 부팅 완료·화면 준비까지 기다린다 (최대 4분)."""
+        self.last_reboot = time.time()
+        log(f"[*] 연속 실패 {n}회 → 휴대폰 재부팅")
+        self.event("self_heal_reboot", f"연속 실패 {n}회 — 휴대폰 자동 재부팅")
+        self.state, self.state_detail = "hold", "자동 복구: 휴대폰 재부팅 중"
+        try:
+            dstat.reboot(self.serial)
+        except Exception as e:
+            log(f"[!] 재부팅 명령 실패: {e}")
+        time.sleep(20.0)
+        end = time.time() + 240
+        booted = False
+        last_hb = 0.0
+        while time.time() < end:
+            # 대기 중에도 heartbeat — fleet 워치독이 5분 정지로 보고 워커를 죽이지 않게
+            if time.time() - last_hb > 25:
+                self.heartbeat()
+                last_hb = time.time()
+            if adb_device_online(self.serial) and self._sh("shell", "getprop", "sys.boot_completed").strip() == "1":
+                booted = True
+                break
+            time.sleep(5.0)
+        if not booted:
+            log("[!] 재부팅 후 4분 내 부팅 완료 미확인 — 다음 루프에서 계속 대기")
+            return
+        time.sleep(15.0)  # 부팅 직후 시스템 앱 안정화
+        try:
+            dstat.disable_pocket_mode(self.serial)
+            keep_screen_on(self.serial)
+            ensure_screen_ready(self.serial, log=log)
+            self._sh("shell", "wm", "dismiss-keyguard")  # PIN 없는 기기의 밀어서 잠금 해제
+            dstat.clear_screen_blockers(self.serial, log=log)
+            dstat.dim_screen(self.serial)
+        except Exception as e:
+            log(f"[!] 재부팅 후 화면 준비 실패: {e}")
+        log("[+] 재부팅 완료 — 작업 재개")
+        self.event("self_heal_reboot_done", "재부팅 완료 — 작업 재개")
+
     # ── 화면 감시 스레드: 꺼지면 강제로 켜고, 방해 창은 치운다 ──────────
     def screen_watchdog(self, stop: threading.Event):
         while not stop.wait(25.0):
@@ -589,6 +679,8 @@ class QueueWorker:
                     mb = f"{used/1048576:.1f}MB" if used is not None else "?"
                     log(f"[+] job#{job['id']} → {status} ({secs:.0f}s, 데이터 {mb})")
                 self.busy_job_id = None
+                if err not in ("campaign paused", "job reclaimed"):
+                    self.after_job(status)
             except KeyboardInterrupt:
                 log("[*] 중단")
                 stop_wd.set()

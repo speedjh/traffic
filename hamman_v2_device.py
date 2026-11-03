@@ -219,20 +219,42 @@ class Chrome:
         self.cdp.send("Network.enable", {})
         self.cdp.send("Page.enable", {})
 
+    def new_tab(self, url: str) -> Optional[dict]:
+        """새 탭을 만들어 /json/list 항목을 돌려준다. 안드로이드 크롬은 /json/new 를 500 으로 거부하므로
+        브라우저 레벨 CDP(Target.createTarget)로 만든다 — 렌더러가 굳은 탭과 무관하게 동작한다."""
+        tid = ""
+        try:
+            ws = (self._http("/json/version") or {}).get("webSocketDebuggerUrl")
+            if ws:
+                b = CDP(ws)
+                try:
+                    tid = b.send("Target.createTarget", {"url": url}, timeout=8).get("targetId", "")
+                finally:
+                    b.close()
+        except Exception:
+            tid = ""
+        if not tid:
+            for method in ("PUT", "GET"):
+                try:
+                    nt = self._http(f"/json/new?{url}", method=method)
+                    if isinstance(nt, dict) and nt.get("id"):
+                        return nt
+                except Exception:
+                    pass
+            return None
+        for _ in range(10):
+            for t in self.pages():
+                if t["id"] == tid and t.get("webSocketDebuggerUrl"):
+                    return t
+            time.sleep(0.3)
+        return None
+
     def open_in_new_tab(self, url: str) -> bool:
         """멈춘 탭을 버리고 새 탭에서 연다. 렌더러가 굳으면 그 탭의 CDP 명령은 전부 응답하지 않는데,
-        탭 생성·종료는 HTTP 엔드포인트라 그 상황에서도 동작한다."""
+        탭 생성(브라우저 레벨)·종료(HTTP)는 그 상황에서도 동작한다."""
         keep = (self.bytes, dict(self.phase_bytes), set(self.origins), getattr(self, "_phase", None))
         old = self.target_id
-        nt = None
-        for method in ("PUT", "GET"):
-            try:
-                nt = self._http(f"/json/new?{url}", method=method)
-                if isinstance(nt, dict) and nt.get("id"):
-                    break
-                nt = None
-            except Exception:
-                nt = None
+        nt = self.new_tab(url)
         if not nt:
             log("    ... 새 탭 생성 실패")
             return False
@@ -390,6 +412,61 @@ class Tracer:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 앱 가로채기 감시: 웹페이지가 kakaolink:// · tel: · market:// 같은 앱 링크를 열면
+# 다른 앱이 크롬 위로 올라와 이후 작업이 전부 실패한다(11/03 SM-A826S: 카카오톡 '이용제한' 창).
+# 크롬 작업 중에만 켜서, 크롬이 아닌 앱이 앞에 오면 닫고 크롬을 다시 앞으로 가져온다.
+# ══════════════════════════════════════════════════════════════════════════
+_FOCUS_OK = (CHROME_PKG, "com.android.systemui", "com.google.android.permissioncontroller",
+             "com.samsung.android.permissioncontroller", "android")
+# 닫아도 되는 앱만 강제 종료. 그 외(런처·설정 등)는 크롬을 앞으로 가져오기만 한다.
+_FORCE_STOP_OK = ("com.kakao.", "com.samsung.android.dialer", "com.android.vending",
+                  "com.sec.android.app.samsungapps", "com.google.android.youtube", "com.instagram.",
+                  "com.facebook.", "com.nhn.android.", "com.naver.", "net.daum.", "com.samsung.android.messaging",
+                  "com.android.mms", "com.disney.", "com.coupang.", "com.zhiliaoapp.", "com.ss.android.")
+
+
+def _focus_pkg(serial: str) -> str:
+    try:
+        out = adb(serial, "shell", "dumpsys", "window", "displays", timeout=8).stdout or ""
+    except Exception:
+        return ""
+    m = re.search(r"mCurrentFocus=Window\{[^}]*?\s([\w.]+)/", out)
+    return m.group(1) if m else ""
+
+
+class AppGuard:
+    def __init__(self, serial: str):
+        self.serial = serial
+        self.active = False
+        self.hits = 0
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(2.5):
+            if not self.active:
+                continue
+            pkg = _focus_pkg(self.serial)
+            if not pkg or pkg in _FOCUS_OK or not self.active:
+                continue
+            self.hits += 1
+            stop = pkg.startswith(_FORCE_STOP_OK)
+            log(f"    ... 크롬 위로 다른 앱이 열림({pkg}) → {'종료' if stop else '뒤로'} 후 크롬 복귀")
+            if stop:
+                adb(self.serial, "shell", "am", "force-stop", pkg)
+            else:
+                adb(self.serial, "shell", "input", "keyevent", "KEYCODE_BACK")
+            adb(self.serial, "shell", "am", "start", "-a", "android.intent.action.MAIN",
+                "-c", "android.intent.category.LAUNCHER", "-n", v1.CHROME_MAIN)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+GUARD: Optional[AppGuard] = None
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 크롬 실행 / 초기화
 # ══════════════════════════════════════════════════════════════════════════
 def launch_chrome(d: u2.Device, serial: str) -> Chrome:
@@ -412,6 +489,47 @@ def launch_chrome(d: u2.Device, serial: str) -> Chrome:
     raise RuntimeError("Chrome 실행 실패")
 
 
+def _dismiss_noise_bg(d: u2.Device, state: dict) -> None:
+    """온보딩·팝업 정리를 백그라운드로. 화면 분석(uiautomator)이 먹통이면 호출 하나가 수십 초씩
+    걸려 실행 대기 시간을 통째로 잡아먹으므로(10/31 사고: 40초 대기가 410초) 메인 루프를 막지 않는다."""
+    if state.get("t") and state["t"].is_alive():
+        return
+
+    def run():
+        try:
+            if ds._safe_exists(d, resourceId=f"{CHROME_PKG}:id/signin_fre_dismiss_button") \
+                    or ds._safe_exists(d, textContains="계정 없이"):
+                state["fre"] = True
+            v1.dismiss_chrome_noise(d, rounds=2)
+        except Exception:
+            pass
+
+    state["t"] = threading.Thread(target=run, daemon=True)
+    state["t"].start()
+
+
+def _fresh_tab(ch: Chrome, pages: List[dict]) -> dict:
+    """크롬은 재시작 때 마지막 탭을 복원한다. 무거운 광고·쇼핑 페이지가 복원되면 그 탭의 렌더러가 굳어
+    CDP 입력이 전부 응답하지 않는다(11/03 사고: 복원된 쇼핑 광고 탭에서 매 작업 실패).
+    빈 탭이 아니면 새 빈 탭을 만들어 쓰고, 광고가 띄운 탭까지 기존 탭은 모두 닫는다."""
+    first = pages[0]
+    if (first.get("url") or "").startswith("about:blank"):
+        keep = first
+    else:
+        keep = ch.new_tab("about:blank")
+        if keep is None:
+            log("[!] 새 빈 탭 생성 실패 — 복원된 탭 그대로 사용")
+            return first
+        log(f"[*] 복원된 탭({(first.get('url') or '')[:40]}) 대신 새 빈 탭 사용 (기존 탭 {len(pages)}개 닫음)")
+    for t in pages:
+        if t["id"] != keep["id"]:
+            try:
+                ch._http(f"/json/close/{t['id']}")
+            except Exception:
+                pass
+    return keep
+
+
 def _launch_chrome_once(d: u2.Device, serial: str, wait_secs: float) -> Chrome:
     log("[*] Chrome 실행")
     adb(serial, "shell", "am", "force-stop", CHROME_PKG)
@@ -421,23 +539,23 @@ def _launch_chrome_once(d: u2.Device, serial: str, wait_secs: float) -> Chrome:
     ch = Chrome(serial)
     ch.forward()
     end = time.time() + wait_secs
-    fre = False
+    noise: dict = {"fre": False}
     while time.time() < end:
         # 초기화 직후라면 온보딩(FRE) 이 뜬다 — V1 과 동일하게 처리
-        if ds._safe_exists(d, resourceId=f"{CHROME_PKG}:id/signin_fre_dismiss_button") \
-                or ds._safe_exists(d, textContains="계정 없이"):
-            fre = True
-        v1.dismiss_chrome_noise(d, rounds=2)
+        _dismiss_noise_bg(d, noise)
         pages = ch.pages()
         if pages:
-            ch.attach(pages[0])
-            # 남은 다른 탭 정리
-            for t in pages[1:]:
-                try:
-                    ch._http(f"/json/close/{t['id']}")
-                except Exception:
-                    pass
-            log(f"[+] DevTools 연결 (port {ch.port}, 탭 {pages[0].get('url', '')[:40] or '-'}{', 온보딩 처리' if fre else ''})")
+            # 정상 기기에선 팝업 정리가 몇 초면 끝난다 — 끝난 뒤 진행해 검색 중 클릭이 겹치지 않게
+            noise["t"].join(timeout=max(0.0, min(10.0, end - time.time())))
+            pages = ch.pages() or pages
+            target = _fresh_tab(ch, pages)
+            ch.attach(target)
+            try:
+                # 새로 만든 탭이 뒤에 숨어(hidden) 있으면 터치 입력이 응답하지 않는다
+                ch.cdp.send("Page.bringToFront", {}, timeout=8)
+            except Exception:
+                pass
+            log(f"[+] DevTools 연결 (port {ch.port}, 탭 {target.get('url', '')[:40] or '-'}{', 온보딩 처리' if noise['fre'] else ''})")
             return ch
         time.sleep(0.5)
     ch.close()
@@ -1058,6 +1176,8 @@ def run_once(d: u2.Device, args, tr: Tracer) -> tuple:
     except Exception as e:
         log(f"[!] Chrome 실행 실패: {e}")
         return False, True, None
+    if GUARD:
+        GUARD.active = True
     try:
         # 이전 실행 잔여 쿠키가 디스크에서 되살아났을 수 있으므로 시작 전에도 한 번 비운다
         reset_identity(ch, final=False)
@@ -1139,8 +1259,10 @@ def main() -> None:
     args = ap.parse_args()
     args.keyword2 = (args.keyword2 or args.place_name or args.keyword).strip()
 
+    global GUARD
     d = ds.connect(args.serial)
     ds.setup_popup_watchers(d)
+    GUARD = AppGuard(args.serial)
     log(f"[*] 함많찾을 V2 키워드: '{args.keyword}' / 2차 '{args.keyword2}'")
     log(f"[*] 체류 {args.dwell_min:.0f}~{args.dwell_max:.0f}s · 스크롤≤{args.dwell_scrolls} · 메인 이미지 차단={args.block_main_images}")
     log("[*] 클릭 정책: DevTools 로 링크 목적지 확인 → 글(블로그/카페/인플루언서/뉴스)만, 광고·플레이스·지도·연관검색 원천 제외")
@@ -1153,7 +1275,8 @@ def main() -> None:
             log(f"\n===== 로테이션 {i} 시작 (함많찾을 V2) =====")
             tr = Tracer(args.serial, args.trace)
             ok, opened, ch = run_once(d, args, tr)
-            log(f"[*] 로테이션 {i} (작업 성공={ok}, 진입={opened})")
+            GUARD.active = False
+            log(f"[*] 로테이션 {i} (작업 성공={ok}, 진입={opened}{f', 앱 가로채기 {GUARD.hits}회 차단' if GUARD.hits else ''})")
             if ch:
                 try:
                     ch.phase("cleanup")
@@ -1178,6 +1301,7 @@ def main() -> None:
     finally:
         log("\n========== 최종 요약 (함많찾을 V2) ==========")
         log(f"[+] 작업 성공: {sum(results)}/{len(results)} 로테이션")
+        GUARD.stop()
         try:
             d.watcher.stop()
         except Exception:
